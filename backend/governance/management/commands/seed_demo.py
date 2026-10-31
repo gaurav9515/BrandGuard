@@ -14,7 +14,9 @@ from PIL import Image, ImageDraw, ImageFont
 from governance.models import (
     BrandGuardUser, SystemSettings, BrandProfile, BrandRule, BrandRuleVersion,
     DraftRule, FactLedger, Submission, SubmissionVersion, AuditFinding,
-    BrandComplianceSignature, ExceptionRequest, Notification, AuditTrail
+    BrandComplianceSignature, ExceptionRequest, Notification, AuditTrail,
+    AuditEvent, CodebaseRepo, CodeSymbolMapping, CodebaseConstant, ProposedFactChange,
+    BlastRadiusReport
 )
 
 
@@ -34,6 +36,8 @@ class Command(BaseCommand):
         sys_settings.color_distance_algorithm = "CIEDE2000"
         sys_settings.color_distance_threshold = 4.0
         sys_settings.friction_min_triggers = 20
+        sys_settings.min_triggers = 10
+        sys_settings.minutes_per_audit = 5
         sys_settings.notification_email = "brand-ops@novapay.io"
         sys_settings.languages_supported = ["en", "es", "fr", "de", "ja"]
         sys_settings.save()
@@ -120,6 +124,14 @@ class Command(BaseCommand):
         profile.allowed_hex_palette = palette
         profile.allowed_fonts = ["Inter", "JetBrains Mono", "Plus Jakarta Sans"]
         profile.save()
+
+        # Link users to BrandProfile
+        admin_user.brand_profile = profile
+        admin_user.save(update_fields=['brand_profile'])
+        writer_1.brand_profile = profile
+        writer_1.save(update_fields=['brand_profile'])
+        writer_2.brand_profile = profile
+        writer_2.save(update_fields=['brand_profile'])
 
         # 3. Brand Rules
         rules_data = [
@@ -864,4 +876,297 @@ class Command(BaseCommand):
             }
         )
 
+        # 12. Governance Telemetry AuditEvents (Module 1)
+        from django.utils import timezone
+        AuditEvent.objects.filter(profile=profile).delete()
+        now = timezone.now()
+
+        # Seed audit events for existing submissions
+        for sub in Submission.objects.filter(profile=profile):
+            v1 = sub.versions.order_by('version_number').first()
+            if not v1:
+                continue
+
+            # Emit SCAN event
+            sub_ts = v1.created_at or (now - timedelta(days=5))
+            AuditEvent.objects.create(
+                profile=profile,
+                user=sub.author or writer_1,
+                event_type='SCAN',
+                submission=sub,
+                submission_version=v1,
+                channel=sub.channel_context,
+                timestamp=sub_ts
+            )
+
+            # Emit findings as RULE_VIOLATED
+            for finding in v1.findings.all():
+                rc = finding.rule_citation_code
+                rule_obj = BrandRule.objects.filter(profile=profile, rule_code=rc).first()
+                fact_obj = FactLedger.objects.filter(profile=profile, fact_code=rc).first()
+                sev = rule_obj.severity if rule_obj else ('BLOCKER' if fact_obj else finding.severity)
+
+                AuditEvent.objects.create(
+                    profile=profile,
+                    user=sub.author or writer_1,
+                    event_type='RULE_VIOLATED',
+                    submission=sub,
+                    submission_version=v1,
+                    rule_code=rc,
+                    fact_code=fact_obj.fact_code if fact_obj else '',
+                    rule=rule_obj,
+                    fact=fact_obj,
+                    severity=sev,
+                    channel=sub.channel_context,
+                    timestamp=sub_ts
+                )
+
+        # Seed historical audit events for rules over the past 28 days
+        historical_rules = [
+            ("LEX_001", 18, 1, "WARNING"),
+            ("LEX_002", 22, 12, "WARNING"),
+            ("LEX_003", 14, 0, "BLOCKER"),
+            ("TONE_001", 12, 6, "WARNING"),
+            ("TONE_002", 15, 2, "WARNING"),
+            ("FACT_012", 24, 0, "BLOCKER"),
+            ("FACT_031", 11, 0, "BLOCKER"),
+            ("VIS_WCAG_001", 16, 0, "BLOCKER"),
+        ]
+
+        channels = ['LINKEDIN_POST', 'PRESS_RELEASE', 'PITCH_DECK', 'LANDING_PAGE']
+        writers = [writer_1, writer_2]
+
+        for code, trigs, ovs, default_sev in historical_rules:
+            rule_obj = BrandRule.objects.filter(profile=profile, rule_code=code).first()
+            fact_obj = FactLedger.objects.filter(profile=profile, fact_code=code).first()
+            sev = rule_obj.severity if rule_obj else ('BLOCKER' if fact_obj else default_sev)
+
+            for i in range(trigs):
+                day_offset = (i % 25) + 1
+                ev_ts = now - timedelta(days=day_offset, hours=(i * 3) % 24)
+                w = writers[i % len(writers)]
+                ch = channels[i % len(channels)]
+
+                AuditEvent.objects.create(
+                    profile=profile,
+                    user=w,
+                    event_type='RULE_VIOLATED',
+                    rule_code=code,
+                    fact_code=fact_obj.fact_code if fact_obj else '',
+                    rule=rule_obj,
+                    fact=fact_obj,
+                    severity=sev,
+                    channel=ch,
+                    timestamp=ev_ts
+                )
+
+            for j in range(ovs):
+                day_offset = (j % 20) + 1
+                ev_ts = now - timedelta(days=day_offset, hours=2)
+                ch = channels[j % len(channels)]
+                AuditEvent.objects.create(
+                    profile=profile,
+                    user=admin_user,
+                    event_type='EXCEPTION_APPROVED',
+                    rule_code=code,
+                    severity=sev,
+                    channel=ch,
+                    timestamp=ev_ts
+                )
+
+        # Historical scans for sparkline
+        for d in range(1, 26):
+            scan_ts = now - timedelta(days=d, hours=10)
+            AuditEvent.objects.create(
+                profile=profile,
+                user=writers[d % 2],
+                event_type='SCAN',
+                channel=channels[d % len(channels)],
+                timestamp=scan_ts
+            )
+
+        self.stdout.write(self.style.SUCCESS(f"Seeded {AuditEvent.objects.count()} live AuditEvent rows for telemetry."))
+
+        # ----------------------------------------------------------------------
+        # Module 2: Codebase-to-Claim Ground-Truth Verifier Demo Data
+        # ----------------------------------------------------------------------
+        repo, created = CodebaseRepo.objects.get_or_create(
+            profile=profile,
+            repo_name="novapay/core-banking",
+            defaults={
+                "repo_url": "https://github.com/novapay/core-banking",
+                "branch": "main",
+                "webhook_secret": "novapay_whsec_live_9942a",
+                "last_commit_sha": "7f3d8a1",
+                "last_scanned_at": now - timedelta(minutes=42),
+                "scan_status": "SUCCESS"
+            }
+        )
+        repo.set_auth_token("ghp_live_read_token_demo_99214")
+        repo.save()
+
+        # Symbol Mappings
+        fact_12 = FactLedger.objects.filter(profile=profile, fact_code="FACT_012").first()
+        fact_08 = FactLedger.objects.filter(profile=profile, fact_code="FACT_008").first()
+
+        map_fee, _ = CodeSymbolMapping.objects.get_or_create(
+            profile=profile,
+            symbol_name="DEFAULT_FX_FEE",
+            defaults={
+                "semantic_key": "fx_fee_rate",
+                "target_fact": fact_12,
+                "unit_type": "PERCENTAGE",
+                "scale_factor": 100.0,
+                "display_format": "{value}%",
+                "confidence_weight": 1.0,
+                "is_active": True
+            }
+        )
+
+        map_settle, _ = CodeSymbolMapping.objects.get_or_create(
+            profile=profile,
+            symbol_name="SETTLEMENT_WINDOW_HOURS",
+            defaults={
+                "semantic_key": "settlement_window_hours",
+                "target_fact": fact_12,
+                "unit_type": "HOURS",
+                "scale_factor": 1.0,
+                "display_format": "{value} hours",
+                "confidence_weight": 1.0,
+                "is_active": True
+            }
+        )
+
+        map_teams, _ = CodeSymbolMapping.objects.get_or_create(
+            profile=profile,
+            symbol_name="ACTIVE_ENTERPRISE_TEAMS",
+            defaults={
+                "semantic_key": "enterprise_teams_adoption",
+                "target_fact": fact_08,
+                "unit_type": "COUNT",
+                "scale_factor": 1.0,
+                "display_format": "{value}+ teams",
+                "confidence_weight": 1.0,
+                "is_active": True
+            }
+        )
+
+        # Extracted Codebase Constants
+        const_fee, _ = CodebaseConstant.objects.get_or_create(
+            repo=repo,
+            symbol_name="DEFAULT_FX_FEE",
+            defaults={
+                "mapping": map_fee,
+                "raw_value": "0.008",
+                "normalized_value": "0.8%",
+                "file_path": "src/payments/constants.py",
+                "line_number": 14,
+                "commit_sha": "7f3d8a1",
+                "confidence": 1.0
+            }
+        )
+
+        const_settle, _ = CodebaseConstant.objects.get_or_create(
+            repo=repo,
+            symbol_name="SETTLEMENT_WINDOW_HOURS",
+            defaults={
+                "mapping": map_settle,
+                "raw_value": "24",
+                "normalized_value": "24 hours",
+                "file_path": "src/payments/settlement.py",
+                "line_number": 28,
+                "commit_sha": "7f3d8a1",
+                "confidence": 1.0
+            }
+        )
+
+        # Proposed Fact Change (Pending Admin Review)
+        if fact_12:
+            prop_change, _ = ProposedFactChange.objects.get_or_create(
+                profile=profile,
+                fact=fact_12,
+                constant=const_fee,
+                defaults={
+                    "old_value": fact_12.claim_truth,
+                    "new_value": "0.8% FX fee schedule",
+                    "code_location": "src/payments/constants.py:14 @ commit 7f3d8a1",
+                    "commit_sha": "7f3d8a1",
+                    "status": "PENDING"
+                }
+            )
+
+        self.stdout.write(self.style.SUCCESS("Module 2 Codebase-to-Claim Verifier demo data seeded."))
+
+        # ----------------------------------------------------------------------
+        # Module 3: Blast Radius of Truth-Change Demo Data
+        # ----------------------------------------------------------------------
+        if fact_12:
+            stale_sub, _ = Submission.objects.get_or_create(
+                profile=profile,
+                title="Q4 Enterprise Cross-Border Campaign",
+                defaults={
+                    "author": writer_1,
+                    "channel_context": "PAID_ADS",
+                    "status": "STALE_REAUDIT_REQUIRED",
+                    "clearance_hash": "",
+                    "clearance_signature": "",
+                }
+            )
+            stale_ver, _ = SubmissionVersion.objects.get_or_create(
+                submission=stale_sub,
+                version_number=1,
+                defaults={
+                    "raw_text": "Experience instant liquidity with guaranteed 0.5% FX rates across global banking corridors.",
+                    "file_type": "TEXT",
+                    "compliance_score": 64.0,
+                }
+            )
+            AuditFinding.objects.get_or_create(
+                version=stale_ver,
+                rule_citation_code=fact_12.fact_code,
+                defaults={
+                    "pillar": "FACTUAL",
+                    "severity": "BLOCKER",
+                    "engine_provenance": "DETERMINISTIC_LEXICON",
+                    "rule_citation_title": f"Stale Truth Contradiction: {fact_12.fact_code}",
+                    "explanation": f"Fact [{fact_12.fact_code}] changed in product code. Asset is marked STALE_REAUDIT_REQUIRED.",
+                    "suggested_fixes": ["Replace with '0.8%'"],
+                    "status": "OPEN",
+                    "source_excerpt": "0.5%",
+                }
+            )
+            BlastRadiusReport.objects.get_or_create(
+                profile=profile,
+                fact=fact_12,
+                defaults={
+                    "trigger_reason": "FACT_CHANGE_APPROVED",
+                    "old_value": "0.5% FX rates",
+                    "new_value": "0.8%",
+                    "affected_assets_count": 1,
+                    "channel_breakdown": {"PAID_ADS": 1},
+                    "severity": "CRITICAL",
+                    "estimated_reach": 50000,
+                    "affected_owners": [
+                        {
+                            "user_id": str(writer_1.id),
+                            "username": writer_1.username,
+                            "name": "Sarah Chen",
+                            "asset_count": 1,
+                            "assets": [{"id": str(stale_sub.id), "title": stale_sub.title}]
+                        }
+                    ],
+                    "draft_patches": [
+                        {
+                            "submission_id": str(stale_sub.id),
+                            "title": stale_sub.title,
+                            "channel": "PAID_ADS",
+                            "old_excerpt": "0.5%",
+                            "replacement": "0.8%",
+                            "original_text": stale_ver.raw_text,
+                            "patched_text": stale_ver.raw_text.replace("0.5%", "0.8%"),
+                        }
+                    ],
+                }
+            )
+        self.stdout.write(self.style.SUCCESS("Module 3 Blast Radius & Staleness demo data seeded."))
         self.stdout.write(self.style.SUCCESS("Demo seeding completed successfully! All data structures verified."))

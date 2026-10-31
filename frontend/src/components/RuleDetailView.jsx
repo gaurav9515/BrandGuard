@@ -33,7 +33,13 @@ import {
 import { useAuth } from '../context/AuthContext';
 import { API_BASE } from '../config/api';
 
-export default function RuleDetailView({ apiBase = API_BASE, onNavigate }) {
+export default function RuleDetailView({
+  apiBase = API_BASE,
+  onNavigate,
+  initialPillar = 'ALL',
+  initialSearch = '',
+  initialRuleCode = null,
+}) {
   const { user, token, isAdmin, isWriter } = useAuth();
 
   // Primary State
@@ -41,9 +47,15 @@ export default function RuleDetailView({ apiBase = API_BASE, onNavigate }) {
   const [drafts, setDrafts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('active_rules'); // 'active_rules' | 'draft_rules'
-  const [pillarFilter, setPillarFilter] = useState('ALL'); // 'ALL' | 'VISUAL' | 'FACTUAL' | 'TONE'
+  const [pillarFilter, setPillarFilter] = useState(initialPillar); // 'ALL' | 'VISUAL' | 'FACTUAL' | 'TONE'
   const [severityFilter, setSeverityFilter] = useState('ALL'); // 'ALL' | 'BLOCKER' | 'WARNING'
-  const [searchQuery, setSearchQuery] = useState('');
+
+  useEffect(() => {
+    if (initialPillar) {
+      setPillarFilter(initialPillar);
+    }
+  }, [initialPillar]);
+  const [searchQuery, setSearchQuery] = useState(initialSearch || '');
   const [toastMessage, setToastMessage] = useState('');
   const [toastType, setToastType] = useState('success'); // 'success' | 'error' | 'info'
 
@@ -185,6 +197,19 @@ export default function RuleDetailView({ apiBase = API_BASE, onNavigate }) {
       setIsEditDrawerOpen(true);
     }
   };
+
+  // Synchronize when opened via global search (initialRuleCode or initialSearch)
+  useEffect(() => {
+    if (initialRuleCode) {
+      setSearchQuery(initialRuleCode);
+      const match = rules.find((r) => r.rule_code === initialRuleCode);
+      if (match) {
+        handleOpenDetail(match);
+      }
+    } else if (initialSearch !== undefined && initialSearch !== '') {
+      setSearchQuery(initialSearch);
+    }
+  }, [initialRuleCode, initialSearch, rules]);
 
   // Save rule updates (PUT/PATCH)
   const handleSaveRuleEdit = async () => {
@@ -506,9 +531,7 @@ export default function RuleDetailView({ apiBase = API_BASE, onNavigate }) {
         <div>
           <div className="flex items-center space-x-3">
             <h1 className="text-2xl font-bold tracking-tight text-zinc-900">Rule Registry & Governance Engine</h1>
-            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800 border border-emerald-200">
-              Ruleset v3.2.4 · Live
-            </span>
+            
           </div>
           <p className="mt-1 text-sm text-zinc-500">
             Deterministic source of truth compiler for NovaPay marketing communications. Changes are immutable and version-stamped.

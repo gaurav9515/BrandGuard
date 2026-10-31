@@ -49,7 +49,8 @@ class Phase5HandoffCliFactsTestCase(TestCase):
             username="admin_p5",
             email="admin5@novapay.io",
             password="adminpassword123",
-            role="ADMIN"
+            role="ADMIN",
+            brand_profile=self.profile
         )
         self.admin_token = generate_user_token(self.admin)
 
@@ -58,7 +59,8 @@ class Phase5HandoffCliFactsTestCase(TestCase):
             username="writer_p5",
             email="writer5@novapay.io",
             password="writerpassword123",
-            role="CONTENT_WRITER"
+            role="CONTENT_WRITER",
+            brand_profile=self.profile
         )
         self.writer_token = generate_user_token(self.writer)
 
@@ -181,8 +183,19 @@ class Phase5HandoffCliFactsTestCase(TestCase):
 
     def test_telemetry_friction_score_and_min_triggers(self):
         """Tests telemetry endpoint with Friction Score calculation and minimum trigger count filter."""
+        from governance.models import AuditEvent, BrandRule
+        rule_high = BrandRule.objects.create(profile=self.profile, rule_code="P5_HIGH", title="High Triggers", pillar="TONE", severity="WARNING")
+        rule_low = BrandRule.objects.create(profile=self.profile, rule_code="P5_LOW", title="Low Triggers", pillar="TONE", severity="WARNING")
+
+        for _ in range(55):
+            AuditEvent.objects.create(profile=self.profile, user=self.writer, event_type="RULE_VIOLATED", rule_code="P5_HIGH", severity="WARNING")
+        for _ in range(10):
+            AuditEvent.objects.create(profile=self.profile, user=self.writer, event_type="RULE_VIOLATED", rule_code="P5_LOW", severity="WARNING")
+
+        headers = {'HTTP_AUTHORIZATION': f'Bearer {self.admin_token}'}
+
         # Test with min_triggers=5
-        res_5 = self.client.get('/api/telemetry/?min_triggers=5')
+        res_5 = self.client.get('/api/telemetry/?min_triggers=5', **headers)
         self.assertEqual(res_5.status_code, 200)
         data_5 = res_5.json()
         self.assertEqual(data_5["min_triggers"], 5)
@@ -190,7 +203,7 @@ class Phase5HandoffCliFactsTestCase(TestCase):
         self.assertIn("overall_friction_index", data_5)
 
         # Test with min_triggers=50 (should filter out low-trigger rules)
-        res_50 = self.client.get('/api/telemetry/?min_triggers=50')
+        res_50 = self.client.get('/api/telemetry/?min_triggers=50', **headers)
         self.assertEqual(res_50.status_code, 200)
         data_50 = res_50.json()
         self.assertEqual(data_50["min_triggers"], 50)
@@ -236,7 +249,10 @@ class Phase5HandoffCliFactsTestCase(TestCase):
         self.assertGreaterEqual(facts_data["expired_count"], 1)
 
         # 2. Check blast radius
-        res_blast = self.client.get(f'/api/facts/{fact.id}/blast-radius/')
+        res_blast = self.client.get(
+            f'/api/facts/{fact.id}/blast-radius/',
+            HTTP_AUTHORIZATION=f'Bearer {self.admin_token}'
+        )
         self.assertEqual(res_blast.status_code, 200)
         blast_data = res_blast.json()
         self.assertGreaterEqual(blast_data["blast_radius_count"], 1)

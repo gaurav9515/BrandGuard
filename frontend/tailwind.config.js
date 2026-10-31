@@ -8,6 +8,24 @@ export default {
   theme: {
     extend: {
       colors: {
+        bg: 'var(--bg)',
+        surface: 'var(--surface)',
+        'surface-alt': 'var(--surface-alt)',
+        border: 'var(--border)',
+        text: 'var(--text)',
+        'text-muted': 'var(--text-muted)',
+        primary: 'var(--primary)',
+        'primary-hover': 'var(--primary-hover)',
+        accent: 'var(--accent)',
+        bark: 'var(--bark)',
+        blocker: 'var(--blocker)',
+        'blocker-tint': 'var(--blocker-tint)',
+        'warning-text': 'var(--warning-text)',
+        'warning-tint': 'var(--warning-tint)',
+        cleared: 'var(--cleared)',
+        'cleared-tint': 'var(--cleared-tint)',
+        info: 'var(--info)',
+        'info-tint': 'var(--info-tint)',
         forest: {
           50: '#EAF5EE',
           100: '#CBE7D4',
@@ -28,6 +46,7 @@ export default {
         }
       },
       fontFamily: {
+        serif: ['Fraunces', 'Georgia', 'serif'],
         sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
         mono: ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
       }

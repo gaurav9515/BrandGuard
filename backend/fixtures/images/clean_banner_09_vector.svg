@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400" viewBox="0 0 800 400">
+  <rect width="800" height="400" fill="#0A3423"/>
+  <rect x="40" y="40" width="720" height="320" rx="16" fill="#F8FAF9"/>
+  <circle cx="90" cy="90" r="24" fill="#00D4B6"/>
+  <text x="130" y="98" font-family="Inter, sans-serif" font-size="28" font-weight="bold" fill="#0A3423">NovaPay Vector</text>
+  <text x="90" y="180" font-family="Inter, sans-serif" font-size="20" fill="#0A3423">Clean Scalable Vector Graphics Representation</text>
+  <rect x="90" y="220" width="180" height="48" rx="8" fill="#0A3423"/>
+  <text x="125" y="250" font-family="Inter, sans-serif" font-size="16" font-weight="600" fill="#00D4B6">Get Started</text>
+</svg>

@@ -26,6 +26,7 @@ export default function Navbar({ activeTab, setActiveTab, queueCount = 3 }) {
   const writerTabs = [
     { id: 'inspector', label: t('nav_inspector', 'Pre-Flight Inspector') },
     { id: 'workspaces', label: t('nav_workspaces', 'My Workspace') },
+    { id: 'telemetry', label: 'My Top Rules' },
   ];
 
   const visibleTabs = isAdmin ? adminTabs : writerTabs;
@@ -43,44 +44,16 @@ export default function Navbar({ activeTab, setActiveTab, queueCount = 3 }) {
 
       <header
         role="banner"
-        className="sticky top-0 z-40 w-full bg-white dark:bg-zinc-900 border-b border-[#E5E7EB] dark:border-zinc-800 px-6 h-14 flex items-center justify-between transition-colors"
+        className="sticky top-0 z-40 w-full bg-[var(--surface)] border-b border-[var(--border)] px-6 h-14 flex items-center justify-between transition-colors shadow-2xs"
       >
-        {/* Left: Brand Identity & Active Ruleset */}
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <div className="w-7 h-7 rounded-lg bg-[#0A3423] dark:bg-emerald-950 flex items-center justify-center border border-emerald-900">
-              <Shield className="w-4 h-4 text-[#00D4B6]" />
-            </div>
-            <span className="font-bold text-zinc-900 dark:text-white text-[15px] tracking-tight">
-              {t('app_title', 'BrandGuard')}
-            </span>
+        {/* Left: Clean Brand Identity (Crowded subtitle, ruleset pill, and role badge removed) */}
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-[var(--primary)] flex items-center justify-center border border-emerald-900/40 shadow-2xs">
+            <Shield className="w-4 h-4 text-white" />
           </div>
-
-          <div className="flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400 font-normal ml-1">
-            <span>NovaPay</span>
-            <span className="text-zinc-400">›</span>
-            <span className="text-zinc-700 dark:text-zinc-300 font-medium">
-              {t('app_subtitle', 'Marketing Compiler')}
-            </span>
-          </div>
-
-          {/* Ruleset Status Pill */}
-          <div className="ml-2 hidden sm:inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full border border-emerald-200 dark:border-emerald-800 bg-[#EAF5EE] dark:bg-emerald-950 font-mono text-[11px] text-[#0A3423] dark:text-emerald-300 font-medium">
-            <span className="w-2 h-2 rounded-full bg-emerald-600 dark:bg-emerald-400 inline-block shadow-sm"></span>
-            <span>{t('ruleset_active', 'Ruleset v3.2 · Active')}</span>
-          </div>
-
-          {/* Role Badge */}
-          {isAdmin && (
-            <span className="ml-1 hidden md:inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-[#0A3423] text-emerald-300 border border-emerald-900">
-              {t('role_admin', 'ADMIN · BRAND LEAD')}
-            </span>
-          )}
-          {isWriter && (
-            <span className="ml-1 hidden md:inline-flex items-center px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-sky-100 dark:bg-sky-950 text-sky-800 dark:text-sky-300 border border-sky-300 dark:border-sky-800">
-              {t('role_writer', 'CONTENT WRITER')}
-            </span>
-          )}
+          <span className="font-bold text-[var(--text)] text-base font-serif tracking-tight">
+            BrandGuard
+          </span>
         </div>
 
         {/* Center: Role-Based Navigation Tabs */}
@@ -114,11 +87,9 @@ export default function Navbar({ activeTab, setActiveTab, queueCount = 3 }) {
           })}
         </nav>
 
-        {/* Right: Server Health Pill, Language Switcher, Theme Toggle, Notifications & User Dropdown */}
-        <div className="flex items-center gap-3">
-          <ServerHealthPill compact />
-
-          {/* Multi-Language Selector Dropdown */}
+        {/* Right: Language Switcher, Theme Toggle, Notifications & User Dropdown */}
+        <div className="flex items-center gap-2.5">
+          {/* Multi-Language Selector Dropdown (Displays "EN" only) */}
           <div className="relative">
             <button
               type="button"
@@ -126,11 +97,10 @@ export default function Navbar({ activeTab, setActiveTab, queueCount = 3 }) {
               title="Change Language"
               aria-label={`Language switcher, current: ${currentLangObj.name}`}
               aria-expanded={langDropdownOpen}
-              className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition cursor-pointer"
+              className="flex items-center gap-1 px-2 py-1 text-xs font-mono font-bold rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--text)] hover:bg-[var(--surface-alt)] transition cursor-pointer"
             >
-              <span>{currentLangObj.flag}</span>
-              <span className="font-mono text-[11px] font-semibold">{currentLangObj.code.toUpperCase()}</span>
-              <ChevronDown className="w-3 h-3 text-zinc-400" />
+              <span>{currentLangObj.code.toUpperCase()}</span>
+              <ChevronDown className="w-3 h-3 text-[var(--text-muted)]" />
             </button>
 
             {langDropdownOpen && (

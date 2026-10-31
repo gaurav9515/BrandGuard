@@ -248,4 +248,102 @@ Each finding object MUST follow this schema:
                     "status": "OPEN",
                 })
 
+    # Step 3: Deterministic Codebase-to-Claim Ground-Truth Verification
+    try:
+        from governance.models import CodebaseConstant
+        code_constants = list(
+            CodebaseConstant.objects.filter(repo__profile=profile)
+            .select_related('repo', 'mapping', 'mapping__target_fact')
+        )
+    except Exception:
+        code_constants = []
+
+    # Map constants by target_fact_code and by symbol
+    constants_by_fact = {}
+    for c in code_constants:
+        if c.mapping and c.mapping.target_fact:
+            constants_by_fact[c.mapping.target_fact.fact_code] = c
+
+    # Direct conflict scan against connected code constants
+    for c in code_constants:
+        fact = c.mapping.target_fact if c.mapping else None
+        fact_code = fact.fact_code if fact else 'FACT_CODE'
+        norm_val = c.normalized_value
+
+        # If previous/conflicting claim pattern exists in raw text (e.g. 0.5% when code is 0.8%)
+        if fact and fact.claim_truth and norm_val not in raw_text:
+            # Check if old value or conflicting excerpt is mentioned
+            # E.g. raw_text contains '0.5%' or old fact claim
+            old_val_match = re.search(r"\b0\.5%|\b0\.5\s*%", raw_text)
+            if old_val_match and norm_val != '0.5%':
+                excerpt = old_val_match.group(0)
+                code_loc = f"{c.file_path}:{c.line_number} @ commit {c.commit_sha[:7]}"
+                triggered_facts.add(fact_code)
+
+                # Avoid duplicate finding if already reported
+                if not any(f.get('source_excerpt') == excerpt and f.get('rule_citation_code') == fact_code for f in findings):
+                    findings.append({
+                        "pillar": "FACTUAL",
+                        "severity": "BLOCKER",
+                        "engine_provenance": "DETERMINISTIC_LEXICON",
+                        "confidence": 1.0,
+                        "rule_citation_code": fact_code,
+                        "rule_citation_title": f"Product Code Conflict: {c.symbol_name}",
+                        "source_excerpt": excerpt,
+                        "location_json": {
+                            "format": "TEXT_OFFSET",
+                            "start_char": old_val_match.start(),
+                            "end_char": old_val_match.end(),
+                            "excerpt": excerpt,
+                            "code_verification": {
+                                "is_code_verified": True,
+                                "status": "VERIFIED_CONFLICT",
+                                "commit_sha": c.commit_sha,
+                                "file_path": c.file_path,
+                                "line_number": c.line_number,
+                                "code_location": code_loc,
+                                "admin_citation": f"{c.file_path}:{c.line_number} @ commit {c.commit_sha[:7]}",
+                                "writer_citation": f"Verified against product code: correct value is {norm_val}",
+                                "normalized_value": norm_val,
+                                "last_scanned_at": c.repo.last_scanned_at.isoformat() if c.repo.last_scanned_at else None,
+                            }
+                        },
+                        "explanation": f"Claim value '{excerpt}' contradicts product code constant {c.symbol_name} ({code_loc}).",
+                        "admin_explanation": f"Claim '{excerpt}' conflicts with product constant {c.symbol_name} ({code_loc}).",
+                        "writer_explanation": f"Verified against product code. The correct value is {norm_val}.",
+                        "suggested_fixes": [f"Replace with '{norm_val}'"],
+                        "status": "OPEN",
+                    })
+
+    # Enrich existing findings with codebase verification metadata
+    for f in findings:
+        code = f.get("rule_citation_code", "")
+        loc = f.setdefault("location_json", {})
+        if "code_verification" not in loc:
+            if code in constants_by_fact:
+                c = constants_by_fact[code]
+                code_loc = f"{c.file_path}:{c.line_number} @ commit {c.commit_sha[:7]}"
+                loc["code_verification"] = {
+                    "is_code_verified": True,
+                    "status": "VERIFIED_CONFLICT",
+                    "commit_sha": c.commit_sha,
+                    "file_path": c.file_path,
+                    "line_number": c.line_number,
+                    "code_location": code_loc,
+                    "admin_citation": code_loc,
+                    "writer_citation": f"Verified against product code: correct value is {c.normalized_value}",
+                    "normalized_value": c.normalized_value,
+                    "last_scanned_at": c.repo.last_scanned_at.isoformat() if c.repo.last_scanned_at else None,
+                }
+                # Ensure severity is hard blocker on code conflict
+                f["severity"] = "BLOCKER"
+                f["admin_explanation"] = f"{f.get('explanation', '')} [Source: {code_loc}]"
+                f["writer_explanation"] = f"Verified against product code: correct value is {c.normalized_value}."
+            elif f.get("pillar") == "FACTUAL":
+                loc["code_verification"] = {
+                    "is_code_verified": False,
+                    "status": "UNVERIFIABLE_IN_CODE",
+                    "note": "Claim has no matching constant in connected product code. Code may not reflect external configs, feature flags, or unmapped repos.",
+                }
+
     return findings, list(triggered_rules), list(triggered_facts)

@@ -188,3 +188,95 @@ def generate_audit_report_pdf(
     pdf_bytes = doc.tobytes()
     doc.close()
     return pdf_bytes
+
+
+def generate_telemetry_report_pdf(telemetry_data: dict, org_name: str = "NovaPay") -> bytes:
+    """
+    Generates an executive PDF report of Governance Telemetry and Ambiguity Diagnostics.
+    """
+    doc = fitz.open()
+    page_w, page_h = 595.0, 842.0  # A4
+    page = doc.new_page(width=page_w, height=page_h)
+
+    # 1. Top Decorative Brand Banner
+    banner_rect = fitz.Rect(0, 0, page_w, 75)
+    page.draw_rect(banner_rect, color=None, fill=hex_to_rgb("#0F172A"))
+    accent_rect = fitz.Rect(0, 72, page_w, 75)
+    page.draw_rect(accent_rect, color=None, fill=hex_to_rgb("#10B981"))
+
+    page.insert_text(fitz.Point(36, 32), f"{org_name.upper()} · LIVE GOVERNANCE TELEMETRY", fontsize=15, fontname="helv", color=hex_to_rgb("#FFFFFF"))
+    page.insert_text(fitz.Point(36, 52), "Ambiguity Diagnostics & Adherence Velocity Report", fontsize=9, fontname="helv", color=hex_to_rgb("#94A3B8"))
+
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    page.insert_text(fitz.Point(400, 32), f"Generated: {now_str}", fontsize=8, fontname="helv", color=hex_to_rgb("#E2E8F0"))
+
+    # 2. KPI Summary Cards
+    kpis = telemetry_data.get('kpis', {})
+    kpi_box = fitz.Rect(36, 90, page_w - 36, 175)
+    page.draw_rect(kpi_box, color=hex_to_rgb("#E2E8F0"), fill=hex_to_rgb("#F8FAFC"), width=1)
+
+    cards = [
+        ("AUDIT VOLUME", str(kpis.get('audit_volume', 0)), f"Last {kpis.get('selected_window_days', 30)} days"),
+        ("FIRST-PASS RATE", f"{kpis.get('first_pass_rate', 100.0)}%", "Clean v1 submissions"),
+        ("REVIEW TIME SAVED", f"{kpis.get('review_time_saved_hours', 0)} hrs", "(estimated)"),
+        ("TOTAL VIOLATIONS", str(kpis.get('total_violations', 0)), f"Overrides: {kpis.get('total_approved_overrides', 0)}")
+    ]
+
+    card_w = (page_w - 72 - 30) / 4
+    for i, (label, val, sub) in enumerate(cards):
+        cx = 46 + i * (card_w + 10)
+        page.insert_text(fitz.Point(cx, 115), label, fontsize=7, fontname="helv", color=hex_to_rgb("#64748B"))
+        page.insert_text(fitz.Point(cx, 142), val, fontsize=16, fontname="helv", color=hex_to_rgb("#0F172A"))
+        page.insert_text(fitz.Point(cx, 160), sub, fontsize=7, fontname="helv", color=hex_to_rgb("#10B981" if "Clean" in sub or "estimated" in sub else "#94A3B8"))
+
+    # 3. Rule Performance Table Header
+    y = 205
+    page.insert_text(fitz.Point(36, y), "RULE PERFORMANCE & AMBIGUITY DIAGNOSIS", fontsize=11, fontname="helv", color=hex_to_rgb("#0F172A"))
+    y += 18
+
+    header_rect = fitz.Rect(36, y, page_w - 36, y + 20)
+    page.draw_rect(header_rect, color=None, fill=hex_to_rgb("#F1F5F9"))
+    page.insert_text(fitz.Point(42, y + 14), "CODE", fontsize=8, fontname="helv", color=hex_to_rgb("#475569"))
+    page.insert_text(fitz.Point(120, y + 14), "TITLE", fontsize=8, fontname="helv", color=hex_to_rgb("#475569"))
+    page.insert_text(fitz.Point(270, y + 14), "SEVERITY", fontsize=8, fontname="helv", color=hex_to_rgb("#475569"))
+    page.insert_text(fitz.Point(330, y + 14), "TRIGGERS", fontsize=8, fontname="helv", color=hex_to_rgb("#475569"))
+    page.insert_text(fitz.Point(385, y + 14), "OVERRIDE", fontsize=8, fontname="helv", color=hex_to_rgb("#475569"))
+    page.insert_text(fitz.Point(440, y + 14), "FRICTION", fontsize=8, fontname="helv", color=hex_to_rgb("#475569"))
+    page.insert_text(fitz.Point(490, y + 14), "DIAGNOSIS", fontsize=8, fontname="helv", color=hex_to_rgb("#475569"))
+    y += 26
+
+    # 4. Table Rows (top 15)
+    rules = telemetry_data.get('rules', [])[:16]
+    for r in rules:
+        if y > 730:
+            break
+        row_rect = fitz.Rect(36, y - 4, page_w - 36, y + 18)
+        page.draw_rect(row_rect, color=None, fill=hex_to_rgb("#FAFAFA" if len(r['rule_code']) % 2 == 0 else "#FFFFFF"))
+
+        page.insert_text(fitz.Point(42, y + 10), r['rule_code'][:12], fontsize=8, fontname="courier", color=hex_to_rgb("#0F172A"))
+        title_str = r['title'][:26] + ("..." if len(r['title']) > 26 else "")
+        page.insert_text(fitz.Point(120, y + 10), title_str, fontsize=8, fontname="helv", color=hex_to_rgb("#334155"))
+        page.insert_text(fitz.Point(270, y + 10), r['severity'], fontsize=8, fontname="helv", color=hex_to_rgb("#DC2626" if r['severity'] == 'BLOCKER' else "#D97706"))
+        page.insert_text(fitz.Point(335, y + 10), str(r['triggers']), fontsize=8, fontname="helv", color=hex_to_rgb("#0F172A"))
+        page.insert_text(fitz.Point(388, y + 10), f"{r['override_rate_pct']}%", fontsize=8, fontname="helv", color=hex_to_rgb("#0F172A"))
+        page.insert_text(fitz.Point(445, y + 10), str(r['friction_score']), fontsize=8, fontname="helv", color=hex_to_rgb("#0F172A"))
+
+        # Diagnosis badge
+        diag_color = hex_to_rgb("#9333EA") if r['diagnosis'] == 'NEEDS_CLARIFICATION' else hex_to_rgb("#D97706") if r['diagnosis'] == 'TRAINING_GAP' else hex_to_rgb("#059669") if r['diagnosis'] == 'HEALTHY_GOVERNANCE' else hex_to_rgb("#64748B")
+        page.insert_text(fitz.Point(490, y + 10), r['diagnosis_label'][:16], fontsize=8, fontname="helv", color=diag_color)
+
+        y += 22
+
+    # 5. Notice & Footer
+    notice_box = fitz.Rect(36, 755, page_w - 36, 795)
+    page.draw_rect(notice_box, color=hex_to_rgb("#E2E8F0"), fill=hex_to_rgb("#F8FAFC"), width=1)
+    page.insert_text(fitz.Point(46, 772), "COMPLIANCE NOTICE: Brand-compliance cleared. Not a substitute for formal legal review.", fontsize=8, fontname="helv", color=hex_to_rgb("#475569"))
+    page.insert_text(fitz.Point(46, 785), "Metrics computed strictly from verified AuditEvent log entries in the active brand profile scope.", fontsize=7, fontname="helv", color=hex_to_rgb("#94A3B8"))
+
+    page.insert_text(fitz.Point(36, 815), "BrandGuard Automated Marketing Compiler & Verification Platform", fontsize=7, fontname="helv", color=hex_to_rgb("#94A3B8"))
+    page.insert_text(fitz.Point(500, 815), "Page 1 of 1", fontsize=7, fontname="helv", color=hex_to_rgb("#94A3B8"))
+
+    pdf_bytes = doc.tobytes()
+    doc.close()
+    return pdf_bytes
+

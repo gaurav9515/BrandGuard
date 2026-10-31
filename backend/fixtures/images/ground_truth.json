@@ -1,0 +1,485 @@
+{
+  "corpus_version": "1.0",
+  "total_images": 42,
+  "description": "BrandGuard Ground-Truth Calibration Corpus for Visual Identity, Contrast, and Accessibility",
+  "images": {
+    "clean_banner_01_desktop.png": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "1200x630 desktop banner adhering strictly to approved palette and 8.5:1 contrast."
+    },
+    "clean_banner_02_square.png": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "1080x1080 square social card in compliant green and teal."
+    },
+    "clean_banner_03_story.webp": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "9:16 mobile story format with valid palette."
+    },
+    "clean_banner_04_leaderboard.jpeg": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "728x90 leaderboard ad format."
+    },
+    "clean_banner_05_darkmode.png": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "Compliant dark mode marketing panel."
+    },
+    "clean_banner_06_highdpi_300.png": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "300 DPI high resolution print card."
+    },
+    "clean_banner_07_srgb_profile.jpeg": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "Explicitly embedded sRGB ICC profile with clean colors."
+    },
+    "clean_banner_08_multipage.pdf": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "2-page fully compliant PDF document."
+    },
+    "clean_banner_09_vector.svg": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "Compliant vector SVG format banner."
+    },
+    "clean_banner_10_product_ad.webp": {
+      "category": "CLEAN_COMPLIANT",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "WebP product ad banner with clean layout."
+    },
+    "subtle_color_01_emerald_drift.png": {
+      "category": "SUBTLE_COLOR_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "delta_e": 4.8,
+          "offending_hex": "#154530"
+        }
+      ],
+      "notes": "Dominant background drifts to #154530 exceeding brand delta_e threshold of 4.0."
+    },
+    "subtle_color_02_teal_cyan_drift.jpeg": {
+      "category": "SUBTLE_COLOR_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "delta_e": 5.6,
+          "offending_hex": "#00ECD0"
+        }
+      ],
+      "notes": "Teal accent shifts into unapproved saturated cyan."
+    },
+    "subtle_color_03_warm_white.webp": {
+      "category": "SUBTLE_COLOR_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "delta_e": 4.9,
+          "offending_hex": "#FAF3E6"
+        }
+      ],
+      "notes": "Off-white has warm cream tint deviating from neutral brand white."
+    },
+    "subtle_color_04_moss_tint.png": {
+      "category": "SUBTLE_COLOR_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "delta_e": 5.3,
+          "offending_hex": "#226B42"
+        }
+      ],
+      "notes": "Secondary card uses uncalibrated moss green."
+    },
+    "subtle_color_05_low_confidence_boundary.png": {
+      "category": "LOW_CONFIDENCE_REVIEW",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "low_confidence": true,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "delta_e": 4.2,
+          "review_reason": "LOW_CONFIDENCE_DETECTION"
+        }
+      ],
+      "notes": "Near-threshold color deviation triggering low-confidence review lane."
+    },
+    "severe_color_01_crimson_cta.png": {
+      "category": "SEVERE_COLOR_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "delta_e": 48.0,
+          "offending_hex": "#E11D48"
+        }
+      ],
+      "notes": "Disallowed promotional crimson button violates institutional trust guidelines."
+    },
+    "severe_color_02_electric_purple.webp": {
+      "category": "SEVERE_COLOR_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "delta_e": 54.0,
+          "offending_hex": "#8B5CF6"
+        }
+      ],
+      "notes": "Full background in electric purple completely violates brand emerald identity."
+    },
+    "severe_color_03_goldenrod_promo.jpeg": {
+      "category": "SEVERE_COLOR_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "delta_e": 42.0,
+          "offending_hex": "#EAB308"
+        }
+      ],
+      "notes": "Bright goldenrod badge violates brand color policy."
+    },
+    "severe_color_04_neon_orange.png": {
+      "category": "SEVERE_COLOR_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "delta_e": 58.0,
+          "offending_hex": "#FF6B00"
+        }
+      ],
+      "notes": "Neon orange promo bar is strictly prohibited."
+    },
+    "severe_color_05_multipage_pdf_violation.pdf": {
+      "category": "SEVERE_COLOR_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_COLOR_001",
+          "severity": "BLOCKER",
+          "page": 2,
+          "offending_hex": "#FF3399"
+        }
+      ],
+      "notes": "Multi-page PDF with severe color violation on second page."
+    },
+    "low_contrast_01_gray_on_white.png": {
+      "category": "LOW_CONTRAST_FAIL",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_WCAG_2.1",
+          "severity": "BLOCKER",
+          "contrast_ratio": 2.4
+        }
+      ],
+      "notes": "Light gray text on white background produces 2.4:1 contrast (below 4.5:1 AA)."
+    },
+    "low_contrast_02_dark_green_on_dark.jpeg": {
+      "category": "LOW_CONTRAST_FAIL",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_WCAG_2.1",
+          "severity": "BLOCKER",
+          "contrast_ratio": 2.1
+        }
+      ],
+      "notes": "Medium green on deep green background produces 2.1:1 contrast."
+    },
+    "low_contrast_03_teal_on_white.webp": {
+      "category": "LOW_CONTRAST_FAIL",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_WCAG_2.1",
+          "severity": "BLOCKER",
+          "contrast_ratio": 1.9
+        }
+      ],
+      "notes": "Bright teal on white gives 1.9:1 contrast failure."
+    },
+    "low_contrast_04_boundary_4_2.png": {
+      "category": "LOW_CONTRAST_FAIL",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_WCAG_2.1",
+          "severity": "BLOCKER",
+          "contrast_ratio": 4.1
+        }
+      ],
+      "notes": "Near-threshold contrast ratio of 4.1:1 strictly fails WCAG 4.5:1 AA standard."
+    },
+    "low_contrast_05_gradient_background.png": {
+      "category": "LOW_CONTRAST_FAIL",
+      "pass_fail": "FAIL",
+      "expected_blockers": 1,
+      "expected_warnings": 0,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_WCAG_2.1",
+          "severity": "BLOCKER",
+          "contrast_ratio": 2.8,
+          "worst_case_sampled": true
+        }
+      ],
+      "notes": "Tests worst-case edge contrast sampling: average bbox passes but local edge contrast fails at 2.8:1."
+    },
+    "cvd_deuteranopia_collapse_01.png": {
+      "category": "CVD_STRESS",
+      "pass_fail": "FAIL",
+      "expected_blockers": 0,
+      "expected_warnings": 1,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_A11Y_CVD",
+          "severity": "WARNING",
+          "cvd_type": "deuteranopia"
+        }
+      ],
+      "notes": "Red and green CTA buttons collapse into indistinguishable brownish shades under deuteranopia."
+    },
+    "cvd_protanopia_collapse_02.png": {
+      "category": "CVD_STRESS",
+      "pass_fail": "FAIL",
+      "expected_blockers": 0,
+      "expected_warnings": 1,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_A11Y_CVD",
+          "severity": "WARNING",
+          "cvd_type": "protanopia"
+        }
+      ],
+      "notes": "Deep red and olive lose contrast under protanopia."
+    },
+    "cvd_tritanopia_collapse_03.png": {
+      "category": "CVD_STRESS",
+      "pass_fail": "FAIL",
+      "expected_blockers": 0,
+      "expected_warnings": 1,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_A11Y_CVD",
+          "severity": "WARNING",
+          "cvd_type": "tritanopia"
+        }
+      ],
+      "notes": "Blue and green elements collapse under tritanopia."
+    },
+    "cvd_low_luminance_cta_04.webp": {
+      "category": "CVD_STRESS",
+      "pass_fail": "FAIL",
+      "expected_blockers": 0,
+      "expected_warnings": 1,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_A11Y_CVD",
+          "severity": "WARNING"
+        }
+      ],
+      "notes": "Equivalent luminance red and green buttons lack secondary shape/text differentiation."
+    },
+    "ratio_16_9_landscape.png": {
+      "category": "EXTREME_ASPECT_RATIO",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "1920x1080 16:9 aspect ratio standard."
+    },
+    "ratio_1_1_square.png": {
+      "category": "EXTREME_ASPECT_RATIO",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "800x800 1:1 aspect ratio square banner."
+    },
+    "ratio_9_16_portrait_story.webp": {
+      "category": "EXTREME_ASPECT_RATIO",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "720x1280 9:16 vertical story format."
+    },
+    "ratio_4_1_leaderboard.jpeg": {
+      "category": "EXTREME_ASPECT_RATIO",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "1200x300 4:1 horizontal billboard banner."
+    },
+    "ratio_1_4_skyscraper.png": {
+      "category": "EXTREME_ASPECT_RATIO",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "300x1200 1:4 vertical tower ad."
+    },
+    "compression_jpeg_q40.jpeg": {
+      "category": "COMPRESSION_ROBUSTNESS",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "Tests that Q=40 compression artifacts do not cause false positive color violations."
+    },
+    "compression_jpeg_q20_heavy.jpeg": {
+      "category": "COMPRESSION_ROBUSTNESS",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "Extreme compression stress test."
+    },
+    "exif_orientation_6_rotated90.jpeg": {
+      "category": "NORMALIZATION_EXIF",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "Tests automatic EXIF rotation transpose handling before CV analysis."
+    },
+    "exif_orientation_3_rotated180.jpeg": {
+      "category": "NORMALIZATION_EXIF",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "Tests 180 degree EXIF rotation normalization."
+    },
+    "color_profile_display_p3.png": {
+      "category": "NORMALIZATION_ICC",
+      "pass_fail": "PASS",
+      "expected_blockers": 0,
+      "expected_warnings": 0,
+      "expected_findings": [],
+      "notes": "Tests ICC color profile conversion to sRGB before CIELAB calculations."
+    },
+    "clearspace_crowded_logo_01.png": {
+      "category": "CLEAR_SPACE_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 0,
+      "expected_warnings": 1,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_LOGO_SPACE",
+          "severity": "WARNING",
+          "edge_density_pct": 12.5
+        }
+      ],
+      "notes": "Copy and decorative lines encroach directly into the 15% logo exclusion zone."
+    },
+    "clearspace_border_encroachment_02.jpeg": {
+      "category": "CLEAR_SPACE_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 0,
+      "expected_warnings": 1,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_LOGO_SPACE",
+          "severity": "WARNING"
+        }
+      ],
+      "notes": "High edge density in clear space perimeter."
+    },
+    "typography_unapproved_font_pdf.pdf": {
+      "category": "TYPOGRAPHY_VIOLATION",
+      "pass_fail": "FAIL",
+      "expected_blockers": 0,
+      "expected_warnings": 1,
+      "expected_findings": [
+        {
+          "rule_code": "VIS_FONT_001",
+          "severity": "WARNING",
+          "unapproved_font": "times-roman"
+        }
+      ],
+      "notes": "PDF embeds Times-Roman typography violating Inter brand standard."
+    }
+  }
+}

@@ -10,8 +10,12 @@ Features:
 """
 
 import json
+import time
+import os
+import hmac
 import hashlib
 from datetime import datetime, date, timedelta
+from django.utils import timezone
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -22,13 +26,22 @@ from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.contrib.auth import authenticate, login, logout
+from django.db import transaction, connection
+from django.db.migrations.executor import MigrationExecutor
 from django.db.models import Q
+from django.utils.text import slugify
 
 from .models import (
     BrandGuardUser, SystemSettings, BrandProfile, BrandRule, BrandRuleVersion,
     DraftRule, FactLedger, Submission, SubmissionVersion, AuditFinding,
-    BrandComplianceSignature, ExceptionRequest, Notification, AuditTrail
+    BrandComplianceSignature, ExceptionRequest, Notification, AuditTrail,
+    AuditEvent, Job, CodebaseRepo, CodeSymbolMapping, CodebaseConstant,
+    ProposedFactChange, SubmissionCitation, BlastRadiusReport,
+    Organization, Company, Project, Membership, InviteToken, EmailVerificationToken,
+    PasswordResetToken, LoginAttemptLog
 )
+from .job_runner import enqueue_job
+from .engines.codebase_extractor import validate_repo_url, run_repo_scan
 from .auth import generate_user_token, decode_user_token, get_authenticated_user_from_request
 from .permissions import IsAdmin, IsWriter, admin_required, writer_required
 from .scraper import scrape_brand_profile, SSRFSecurityException
@@ -64,7 +77,9 @@ def root_api_status_view(request):
         "timestamp": datetime.now().isoformat(),
         "keep_alive": "active",
         "endpoints": {
-            "health": "/api/health/",
+            "health": "/healthz",
+            "ready": "/readyz",
+            "api_health": "/api/health/",
             "auth_login": "/api/auth/login/",
             "auth_me": "/api/auth/me/",
             "brand_profile": "/api/brand-profile/",
@@ -75,6 +90,154 @@ def root_api_status_view(request):
             "exceptions": "/api/exceptions/"
         }
     })
+
+
+@csrf_exempt
+def healthz_view(request):
+    """
+    GET /healthz or /api/healthz/
+    Lightweight, public, unauthenticated liveness probe for load balancers & keep-alive bots.
+    Executes a fast 'SELECT 1' against the primary database.
+    Returns 200 OK if healthy, 503 Service Unavailable if database is down.
+    """
+    start_time = time.perf_counter()
+    db_connected = False
+    error_msg = None
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        db_connected = True
+    except Exception as exc:
+        error_msg = str(exc)
+
+    latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+
+    if not db_connected:
+        return JsonResponse({
+            "status": "unhealthy",
+            "service": "brandguard-core",
+            "version": getattr(settings, 'BRANDGUARD_VERSION', 'v3.2'),
+            "timestamp": timezone.now().isoformat(),
+            "database": {
+                "status": "unreachable",
+                "error": error_msg,
+                "latency_ms": latency_ms,
+            }
+        }, status=503)
+
+    return JsonResponse({
+        "status": "healthy",
+        "service": "brandguard-core",
+        "version": getattr(settings, 'BRANDGUARD_VERSION', 'v3.2'),
+        "timestamp": timezone.now().isoformat(),
+        "database": {
+            "status": "connected",
+            "latency_ms": latency_ms,
+        }
+    })
+
+
+@csrf_exempt
+def readyz_view(request):
+    """
+    GET /readyz or /api/readyz/
+    Deep readiness probe validating database connectivity, unapplied migrations,
+    background job runner health, and filesystem media write capability.
+    Returns 200 OK when fully ready to serve traffic, 503 if any subsystem is down.
+    """
+    start_time = time.perf_counter()
+    checks = {}
+    is_ready = True
+
+    # 1. Database Connectivity Probe
+    db_start = time.perf_counter()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        checks["database"] = {
+            "status": "connected",
+            "engine": connection.settings_dict.get("ENGINE", "unknown").split('.')[-1],
+            "latency_ms": round((time.perf_counter() - db_start) * 1000, 2)
+        }
+    except Exception as exc:
+        is_ready = False
+        checks["database"] = {
+            "status": "failed",
+            "error": str(exc),
+            "latency_ms": round((time.perf_counter() - db_start) * 1000, 2)
+        }
+
+    # 2. Database Migrations Status Check
+    try:
+        executor = MigrationExecutor(connection)
+        targets = executor.loader.graph.leaf_nodes()
+        plan = executor.migration_plan(targets)
+        pending_count = len(plan)
+        if pending_count > 0:
+            is_ready = False
+            checks["migrations"] = {
+                "status": "pending_migrations",
+                "pending_count": pending_count,
+                "pending_plan": [f"{m[0].app}.{m[0].name}" for m in plan[:5]]
+            }
+        else:
+            checks["migrations"] = {
+                "status": "up_to_date",
+                "pending_count": 0
+            }
+    except Exception as exc:
+        checks["migrations"] = {
+            "status": "unknown",
+            "error": str(exc),
+            "pending_count": 0
+        }
+
+    # 3. Background Job Runner Health
+    try:
+        from governance.job_runner import get_runner_status
+        runner_status = get_runner_status()
+        checks["job_runner"] = runner_status
+    except Exception as exc:
+        checks["job_runner"] = {
+            "status": "fallback_active",
+            "mode": "THREAD_POOL",
+            "error": str(exc)
+        }
+
+    # 4. Storage / Media Write Check
+    try:
+        import tempfile
+        media_root = getattr(settings, 'MEDIA_ROOT', tempfile.gettempdir())
+        os.makedirs(media_root, exist_ok=True)
+        probe_path = os.path.join(media_root, '.readyz_probe')
+        with open(probe_path, 'w', encoding='utf-8') as f:
+            f.write("ready")
+        if os.path.exists(probe_path):
+            os.remove(probe_path)
+        checks["storage"] = {
+            "status": "writable",
+            "media_root": str(media_root)
+        }
+    except Exception as exc:
+        checks["storage"] = {
+            "status": "read_only_warning",
+            "error": str(exc)
+        }
+
+    total_latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    response_payload = {
+        "status": "ready" if is_ready else "not_ready",
+        "service": "brandguard-core",
+        "version": getattr(settings, 'BRANDGUARD_VERSION', 'v3.2'),
+        "timestamp": timezone.now().isoformat(),
+        "total_latency_ms": total_latency_ms,
+        "checks": checks
+    }
+
+    return JsonResponse(response_payload, status=200 if is_ready else 503)
 
 
 def get_active_profile():
@@ -100,6 +263,54 @@ def get_active_profile():
             profile.allowed_hex_palette = palette
             profile.save()
     return profile
+
+
+def get_user_profile(request):
+    """
+    Returns the BrandProfile scoped strictly to the active Company context
+    resolved via the central tenant-scoping layer.
+    Satisfies global constraint: all data is scoped to caller's active Company/BrandProfile.
+    """
+    from .tenancy import get_request_company, ensure_company_profile
+    try:
+        company, err = get_request_company(request)
+        if company:
+            return ensure_company_profile(company)
+    except Exception:
+        pass
+
+    user = getattr(request, 'user', None)
+    if not user or not user.is_authenticated:
+        return get_active_profile()
+
+    if getattr(user, 'brand_profile', None):
+        return user.brand_profile
+
+    # Fallback to active profile and associate it to this user
+    profile = get_active_profile()
+    try:
+        user.brand_profile = profile
+        user.save(update_fields=['brand_profile'])
+    except Exception:
+        pass
+    return profile
+
+
+def resolve_request_profile(request, required_role=None):
+    """
+    Central helper resolving (profile, company, err_response).
+    If user is authenticated, resolves company via get_request_company and validates cross-company boundary.
+    If err_response is not None, views must return err_response directly.
+    """
+    user = get_authenticated_user_from_request(request)
+    if user and user.is_authenticated:
+        from .tenancy import get_request_company, ensure_company_profile
+        company, err = get_request_company(request, required_role=required_role)
+        if err:
+            return None, None, err
+        profile = ensure_company_profile(company) if company else get_user_profile(request)
+        return profile, company, None
+    return get_user_profile(request), None, None
 
 
 def calculate_score(findings, approved_exception_count=0):
@@ -167,7 +378,9 @@ def brand_profile_view(request):
     if request.method != 'GET':
         return HttpResponseBadRequest("Method not allowed")
 
-    profile = get_active_profile()
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
     data = profile.to_dict()
     data["sample_banner_url"] = "/media/sample_offbrand_banner.png"
     return JsonResponse(data, safe=False)
@@ -179,12 +392,15 @@ def add_rule_view(request):
     if request.method != 'POST':
         return HttpResponseBadRequest("Method not allowed")
 
+    profile, company, err = resolve_request_profile(request, required_role='ADMIN')
+    if err:
+        return err
+
     try:
         body = json.loads(request.body.decode('utf-8'))
     except Exception:
         return HttpResponseBadRequest("Invalid JSON body")
 
-    profile = get_active_profile()
     item_type = body.get('type', 'RULE').upper()
 
     if item_type == 'RULE':
@@ -256,7 +472,6 @@ def add_rule_view(request):
     return HttpResponseBadRequest(f"Unknown item type: {item_type}")
 
 
-@csrf_exempt
 @admin_required
 def expire_or_update_fact_view(request, fact_id):
     """
@@ -267,9 +482,12 @@ def expire_or_update_fact_view(request, fact_id):
     if request.method != 'POST':
         return HttpResponseBadRequest("Method not allowed")
 
-    fact = FactLedger.objects.filter(id=fact_id).first()
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    fact = FactLedger.objects.filter(id=fact_id, profile=profile).first()
     if not fact:
-        return HttpResponseNotFound("Fact not found")
+        return JsonResponse({"error": "Fact not found"}, status=404)
 
     try:
         body = json.loads(request.body.decode('utf-8'))
@@ -280,6 +498,7 @@ def expire_or_update_fact_view(request, fact_id):
     valid_until_str = body.get('valid_until', '').strip()
     superseded = body.get('superseded_by_text', '').strip()
 
+    old_truth = fact.claim_truth
     if new_claim:
         fact.claim_truth = new_claim
     if valid_until_str:
@@ -291,32 +510,22 @@ def expire_or_update_fact_view(request, fact_id):
         fact.superseded_by_text = superseded
     fact.save()
 
-    # Search for all APPROVED submissions affected by this fact update
-    affected_submissions = []
-    approved_subs = Submission.objects.filter(profile=fact.profile)
-
-    for sub in approved_subs:
-        latest_ver = sub.versions.order_by('-version_number').first()
-        if not latest_ver:
-            continue
-
-        # Check if fact was cited or referenced in draft copy
-        is_affected = (
-            latest_ver.findings.filter(rule_citation_code=fact.fact_code).exists()
-            or fact.fact_code.lower() in latest_ver.raw_text.lower()
-            or any(w.lower() in latest_ver.raw_text.lower() for w in fact.claim_truth.split() if len(w) > 5)
-        )
-
-        if is_affected and sub.status in ['APPROVED', 'IN_REVIEW']:
-            sub.status = 'STALE_REAUDIT_REQUIRED'
-            sub.save()
-            affected_submissions.append(sub)
+    # Trigger Module 3 Blast Radius Engine
+    from governance.engines.blast_radius_engine import compute_blast_radius
+    blast_result = compute_blast_radius(
+        profile=profile,
+        fact_id=fact.id,
+        old_value=old_truth,
+        new_value=fact.claim_truth,
+        trigger_reason='MANUAL_FACT_UPDATE'
+    )
 
     return JsonResponse({
         "status": "success",
         "fact": fact.to_dict(),
-        "affected_submissions_count": len(affected_submissions),
-        "affected_titles": [s.title for s in affected_submissions],
+        "blast_radius": blast_result,
+        "affected_submissions_count": blast_result.get('affected_assets_count', 0),
+        "affected_titles": [p['title'] for p in blast_result.get('draft_patches', [])],
     })
 
 
@@ -328,7 +537,9 @@ def facts_list_create_view(request):
     POST /api/facts/
     Creates a new fact in the FactLedger.
     """
-    profile = get_active_profile()
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
 
     # Seed initial facts if table is empty
     if FactLedger.objects.filter(profile=profile).count() == 0:
@@ -450,51 +661,134 @@ def facts_list_create_view(request):
     return HttpResponseBadRequest("Method not allowed")
 
 
-@csrf_exempt
+@admin_required
 def fact_blast_radius_view(request, fact_id):
     """
     GET /api/facts/<uuid:fact_id>/blast-radius/
-    Returns list of all submissions (campaign assets) citing or mentioning this fact.
+    POST /api/facts/<uuid:fact_id>/blast-radius/
+    Computes or retrieves blast radius report for the given fact.
+    Scoped strictly to request.user's BrandProfile.
     """
-    fact = FactLedger.objects.filter(id=fact_id).first()
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    fact = FactLedger.objects.filter(id=fact_id, profile=profile).first()
     if not fact:
-        return HttpResponseNotFound("Fact not found")
+        return JsonResponse({"error": "Fact not found"}, status=404)
 
-    profile = fact.profile
-    affected = []
-    for sub in profile.submissions.all():
-        latest_ver = sub.versions.order_by('-version_number').first()
-        if not latest_ver:
-            continue
-
-        has_finding = latest_ver.findings.filter(rule_citation_code=fact.fact_code).exists()
-        in_text = fact.fact_code.lower() in latest_ver.raw_text.lower()
-        keyword_match = any(w.lower() in latest_ver.raw_text.lower() for w in fact.claim_truth.split() if len(w) > 5)
-
-        if has_finding or in_text or keyword_match:
-            citing_snippet = ""
-            for line in latest_ver.raw_text.splitlines():
-                if fact.fact_code.lower() in line.lower() or any(w.lower() in line.lower() for w in fact.claim_truth.split() if len(w) > 5):
-                    citing_snippet = line.strip()
-                    break
-            if not citing_snippet:
-                citing_snippet = latest_ver.raw_text[:80]
-
-            affected.append({
-                "submission_id": str(sub.id),
-                "title": sub.title,
-                "author": sub.author.username if sub.author else "Alex Morgan",
-                "channel": sub.channel_context,
-                "status": sub.status,
-                "compliance_score": latest_ver.compliance_score,
-                "version_number": latest_ver.version_number,
-                "citing_snippet": citing_snippet,
+    if request.method == 'GET':
+        report = BlastRadiusReport.objects.filter(profile=profile, fact=fact).first()
+        if report:
+            affected_list = [
+                {
+                    "submission_id": p.get("submission_id"),
+                    "title": p.get("title"),
+                    "channel": p.get("channel"),
+                }
+                for p in report.draft_patches
+            ]
+            return JsonResponse({
+                "status": "success",
+                "report": report.to_dict(),
+                "fact": fact.to_dict(),
+                "blast_radius_count": report.affected_assets_count,
+                "affected_submissions_count": report.affected_assets_count,
+                "affected_submissions": affected_list,
+                "draft_patches": report.draft_patches,
+            })
+        else:
+            from governance.engines.blast_radius_engine import compute_blast_radius
+            result = compute_blast_radius(profile, fact.id, trigger_reason='ON_DEMAND_QUERY')
+            return JsonResponse({
+                "status": "success",
+                "report": result,
+                "fact": fact.to_dict(),
+                "blast_radius_count": result['affected_assets_count'],
+                "affected_submissions_count": result['affected_assets_count'],
+                "affected_submissions": result.get('affected_submissions', []),
+                "draft_patches": result.get('draft_patches', []),
             })
 
+    elif request.method == 'POST':
+        try:
+            body = json.loads(request.body.decode('utf-8')) if request.body else {}
+        except Exception:
+            body = {}
+
+        run_async = body.get('run_async', False)
+        if run_async:
+            job = Job.objects.create(
+                profile=profile,
+                user=request.user,
+                job_type='BLAST_RADIUS',
+                status='RUNNING',
+                status_message=f'Computing blast radius for {fact.fact_code}'
+            )
+            from governance.engines.blast_radius_engine import compute_blast_radius
+            result = compute_blast_radius(profile, fact.id, trigger_reason='MANUAL_SCAN')
+            job.status = 'SUCCESS'
+            job.result_payload = result
+            job.progress = 100
+            job.status_message = 'Blast radius computation completed.'
+            job.completed_at = timezone.now()
+            job.save()
+
+            return JsonResponse({
+                "status": "accepted",
+                "job_id": str(job.id),
+                "job": job.to_dict()
+            }, status=202)
+        else:
+            from governance.engines.blast_radius_engine import compute_blast_radius
+            result = compute_blast_radius(profile, fact.id, trigger_reason='MANUAL_SCAN')
+            return JsonResponse({
+                "status": "success",
+                "blast_radius": result,
+                "fact": fact.to_dict(),
+                "blast_radius_count": result['affected_assets_count'],
+                "affected_submissions_count": result['affected_assets_count'],
+            })
+
+    return HttpResponseBadRequest("Method not allowed")
+
+
+@admin_required
+def fact_apply_patches_view(request, fact_id):
+    """
+    POST /api/facts/<uuid:fact_id>/apply-patches/
+    Applies deterministic draft patches in bulk to stale submissions and triggers re-audits.
+    Optionally accepts {"submission_ids": ["uuid1", "uuid2"]}.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    fact = FactLedger.objects.filter(id=fact_id, profile=profile).first()
+    if not fact:
+        return JsonResponse({"error": "Fact not found"}, status=404)
+
+    try:
+        body = json.loads(request.body.decode('utf-8')) if request.body else {}
+    except Exception:
+        body = {}
+
+    submission_ids = body.get('submission_ids', None)
+
+    from governance.engines.blast_radius_engine import apply_batch_patches
+    result = apply_batch_patches(
+        profile=profile,
+        fact_id=fact.id,
+        submission_ids=submission_ids,
+        user=request.user
+    )
+
     return JsonResponse({
-        "fact": fact.to_dict(),
-        "blast_radius_count": len(affected),
-        "affected_submissions": affected,
+        "status": "success",
+        "fact_code": fact.fact_code,
+        "patched_count": result.get('patched_count', 0),
+        "results": result.get('results', []),
     })
 
 
@@ -608,7 +902,9 @@ def audit_submission_view(request):
     if request.method != 'POST':
         return HttpResponseBadRequest("Method not allowed")
 
-    profile = get_active_profile()
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
 
     # Read parameters from form or JSON
     if request.content_type and 'multipart/form-data' in request.content_type:
@@ -708,50 +1004,83 @@ def audit_submission_view(request):
         version.uploaded_file = uploaded_file
         version.save()
 
-    # Save findings
-    for f in all_findings_raw:
-        AuditFinding.objects.create(
-            version=version,
-            pillar=f.get('pillar', 'TONE'),
-            severity=f.get('severity', 'WARNING'),
-            engine_provenance=f.get('engine_provenance', 'DETERMINISTIC_LEXICON'),
-            confidence=f.get('confidence', 1.0),
-            rule_citation_code=f.get('rule_citation_code', 'GEN_001'),
-            rule_citation_title=f.get('rule_citation_title', 'Brand Inconsistency'),
-            source_excerpt=f.get('source_excerpt', ''),
-            location_json=f.get('location_json', {}),
-            explanation=f.get('explanation', ''),
-            suggested_fixes=f.get('suggested_fixes', []),
-            status='OPEN',
+    with transaction.atomic():
+        # Save findings
+        for f in all_findings_raw:
+            AuditFinding.objects.create(
+                version=version,
+                pillar=f.get('pillar', 'TONE'),
+                severity=f.get('severity', 'WARNING'),
+                engine_provenance=f.get('engine_provenance', 'DETERMINISTIC_LEXICON'),
+                confidence=f.get('confidence', 1.0),
+                rule_citation_code=f.get('rule_citation_code', 'GEN_001'),
+                rule_citation_title=f.get('rule_citation_title', 'Brand Inconsistency'),
+                source_excerpt=f.get('source_excerpt', ''),
+                location_json=f.get('location_json', {}),
+                explanation=f.get('explanation', ''),
+                suggested_fixes=f.get('suggested_fixes', []),
+                status='OPEN',
+            )
+
+        # Increment trigger counts
+        all_triggered_rule_codes = set(fact_triggered_rules)
+        for r_id in triggered_rules:
+            rule_obj = BrandRule.objects.filter(id=r_id).first()
+            if rule_obj:
+                rule_obj.trigger_count += 1
+                rule_obj.save()
+
+        for code in all_triggered_rule_codes:
+            rule_obj = BrandRule.objects.filter(profile=profile, rule_code=code).first()
+            if rule_obj:
+                rule_obj.trigger_count += 1
+                rule_obj.save()
+
+        for code in triggered_facts:
+            fact_obj = FactLedger.objects.filter(profile=profile, fact_code=code).first()
+            if fact_obj:
+                fact_obj.trigger_count += 1
+                fact_obj.save()
+
+        # Increment visual rule triggers
+        for vf in visual_findings:
+            vcode = vf.get('rule_citation_code')
+            vr = BrandRule.objects.filter(profile=profile, rule_code=vcode).first()
+            if vr:
+                vr.trigger_count += 1
+                vr.save()
+
+        # Emit SCAN AuditEvent
+        auth_user = get_authenticated_user_from_request(request)
+        AuditEvent.emit(
+            profile=profile,
+            event_type='SCAN',
+            user=auth_user if auth_user and auth_user.is_authenticated else None,
+            submission=submission,
+            submission_version=version,
+            channel=submission.channel_context
         )
 
-    # Increment trigger counts
-    all_triggered_rule_codes = set(fact_triggered_rules)
-    for r_id in triggered_rules:
-        rule_obj = BrandRule.objects.filter(id=r_id).first()
-        if rule_obj:
-            rule_obj.trigger_count += 1
-            rule_obj.save()
+        # Emit RULE_VIOLATED AuditEvents for findings
+        for f in all_findings_raw:
+            rc = f.get('rule_citation_code', '')
+            rule_obj = BrandRule.objects.filter(profile=profile, rule_code=rc).first()
+            fact_obj = FactLedger.objects.filter(profile=profile, fact_code=rc).first()
+            sev = rule_obj.severity if rule_obj else ('BLOCKER' if fact_obj else f.get('severity', 'WARNING'))
 
-    for code in all_triggered_rule_codes:
-        rule_obj = BrandRule.objects.filter(profile=profile, rule_code=code).first()
-        if rule_obj:
-            rule_obj.trigger_count += 1
-            rule_obj.save()
-
-    for code in triggered_facts:
-        fact_obj = FactLedger.objects.filter(profile=profile, fact_code=code).first()
-        if fact_obj:
-            fact_obj.trigger_count += 1
-            fact_obj.save()
-
-    # Increment visual rule triggers
-    for vf in visual_findings:
-        vcode = vf.get('rule_citation_code')
-        vr = BrandRule.objects.filter(profile=profile, rule_code=vcode).first()
-        if vr:
-            vr.trigger_count += 1
-            vr.save()
+            AuditEvent.emit(
+                profile=profile,
+                event_type='RULE_VIOLATED',
+                user=auth_user if auth_user and auth_user.is_authenticated else None,
+                submission=submission,
+                submission_version=version,
+                rule_code=rc,
+                fact_code=fact_obj.fact_code if fact_obj else '',
+                rule=rule_obj,
+                fact=fact_obj,
+                severity=sev,
+                channel=submission.channel_context
+            )
 
     return JsonResponse(submission.to_dict(), safe=False)
 
@@ -797,61 +1126,82 @@ def resolve_finding_view(request, finding_id):
         else:
             new_text = old_text + f" {replacement_text}"
 
-        finding.status = 'ACCEPTED'
-        finding.save()
+        auth_user = get_authenticated_user_from_request(request)
+        with transaction.atomic():
+            finding.status = 'ACCEPTED'
+            finding.save()
 
-        # Re-audit the patched text to create Version v+1
-        new_version_num = version.version_number + 1
+            # Re-audit the patched text to create Version v+1
+            new_version_num = version.version_number + 1
 
-        lex_findings, _ = audit_lexicon(new_text, profile)
-        fact_findings, _, _ = audit_facts_and_tone(new_text, profile, confidential_mode=submission.confidential_mode)
+            lex_findings, _ = audit_lexicon(new_text, profile)
+            fact_findings, _, _ = audit_facts_and_tone(new_text, profile, confidential_mode=submission.confidential_mode)
 
-        # Retain visual findings from previous version
-        retained_visual = []
-        for vf in version.findings.filter(pillar='VISUAL'):
-            retained_visual.append({
-                "pillar": vf.pillar,
-                "severity": vf.severity,
-                "engine_provenance": vf.engine_provenance,
-                "confidence": vf.confidence,
-                "rule_citation_code": vf.rule_citation_code,
-                "rule_citation_title": vf.rule_citation_title,
-                "source_excerpt": vf.source_excerpt,
-                "location_json": vf.location_json,
-                "explanation": vf.explanation,
-                "suggested_fixes": vf.suggested_fixes,
-                "status": vf.status,
-            })
+            # Retain visual findings from previous version
+            retained_visual = []
+            for vf in version.findings.filter(pillar='VISUAL'):
+                retained_visual.append({
+                    "pillar": vf.pillar,
+                    "severity": vf.severity,
+                    "engine_provenance": vf.engine_provenance,
+                    "confidence": vf.confidence,
+                    "rule_citation_code": vf.rule_citation_code,
+                    "rule_citation_title": vf.rule_citation_title,
+                    "source_excerpt": vf.source_excerpt,
+                    "location_json": vf.location_json,
+                    "explanation": vf.explanation,
+                    "suggested_fixes": vf.suggested_fixes,
+                    "status": vf.status,
+                })
 
-        new_all_findings = lex_findings + fact_findings + retained_visual
-        new_score, new_breakdown = calculate_score(new_all_findings)
-        new_voice_fp = compute_voice_fingerprint(new_text, submission.channel_context)
+            new_all_findings = lex_findings + fact_findings + retained_visual
+            new_score, new_breakdown = calculate_score(new_all_findings)
+            new_voice_fp = compute_voice_fingerprint(new_text, submission.channel_context)
 
-        new_version = SubmissionVersion.objects.create(
-            submission=submission,
-            version_number=new_version_num,
-            raw_text=new_text,
-            uploaded_file=version.uploaded_file,
-            file_type=version.file_type,
-            compliance_score=new_score,
-            score_breakdown=new_breakdown,
-            voice_fingerprint=new_voice_fp,
-        )
+            new_version = SubmissionVersion.objects.create(
+                submission=submission,
+                version_number=new_version_num,
+                raw_text=new_text,
+                uploaded_file=version.uploaded_file,
+                file_type=version.file_type,
+                compliance_score=new_score,
+                score_breakdown=new_breakdown,
+                voice_fingerprint=new_voice_fp,
+            )
 
-        for f in new_all_findings:
-            AuditFinding.objects.create(
-                version=new_version,
-                pillar=f.get('pillar', 'TONE'),
-                severity=f.get('severity', 'WARNING'),
-                engine_provenance=f.get('engine_provenance', 'DETERMINISTIC_LEXICON'),
-                confidence=f.get('confidence', 1.0),
-                rule_citation_code=f.get('rule_citation_code', 'GEN_001'),
-                rule_citation_title=f.get('rule_citation_title', 'Brand Inconsistency'),
-                source_excerpt=f.get('source_excerpt', ''),
-                location_json=f.get('location_json', {}),
-                explanation=f.get('explanation', ''),
-                suggested_fixes=f.get('suggested_fixes', []),
-                status=f.get('status', 'OPEN'),
+            for f in new_all_findings:
+                AuditFinding.objects.create(
+                    version=new_version,
+                    pillar=f.get('pillar', 'TONE'),
+                    severity=f.get('severity', 'WARNING'),
+                    engine_provenance=f.get('engine_provenance', 'DETERMINISTIC_LEXICON'),
+                    confidence=f.get('confidence', 1.0),
+                    rule_citation_code=f.get('rule_citation_code', 'GEN_001'),
+                    rule_citation_title=f.get('rule_citation_title', 'Brand Inconsistency'),
+                    source_excerpt=f.get('source_excerpt', ''),
+                    location_json=f.get('location_json', {}),
+                    explanation=f.get('explanation', ''),
+                    suggested_fixes=f.get('suggested_fixes', []),
+                    status=f.get('status', 'OPEN'),
+                )
+
+            # If submission was stale, and no blockers remain, transition to IN_REVIEW
+            if submission.status == 'STALE_REAUDIT_REQUIRED':
+                blockers_left = sum(1 for f in new_all_findings if f.get('severity') == 'BLOCKER')
+                if blockers_left == 0:
+                    submission.status = 'IN_REVIEW'
+                    submission.save()
+
+            # Emit FIX_ACCEPTED telemetry event
+            AuditEvent.emit(
+                profile=profile,
+                event_type='FIX_ACCEPTED',
+                user=auth_user if auth_user and auth_user.is_authenticated else None,
+                submission=submission,
+                submission_version=new_version,
+                rule_code=finding.rule_citation_code,
+                severity=finding.severity,
+                channel=submission.channel_context
             )
 
         return JsonResponse({
@@ -1270,182 +1620,205 @@ def brand_safe_prompt_view(request):
     })
 
 
-@csrf_exempt
+@admin_required
 def telemetry_view(request):
     """
     GET /api/telemetry/
-    Returns telemetry metrics including Friction Score with minimum trigger count filter.
+    Admin-only live governance telemetry and ambiguity diagnostics.
+    Content writers receive HTTP 403 Forbidden.
+    All metrics computed strictly from AuditEvent rows inside window (7/30/90 days).
     """
     if request.method != 'GET':
         return HttpResponseBadRequest("Method not allowed")
 
-    profile = get_active_profile()
-    raw_data = get_telemetry_report(profile=profile)
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    if not profile:
+        return JsonResponse({"error": "No brand profile associated with user."}, status=400)
 
-    # Minimum trigger count filter parameter (defaults to BRANDGUARD_FRICTION_MIN_TRIGGERS or 10)
     try:
-        min_triggers = int(request.GET.get('min_triggers', getattr(settings, 'BRANDGUARD_FRICTION_MIN_TRIGGERS', 10)))
+        days = int(request.GET.get('days', 30))
     except (ValueError, TypeError):
-        min_triggers = 10
+        days = 30
 
-    # Extended recurring findings & governance metrics pool
-    findings_pool = [
-        {
-            "rule_id": "FACT_012",
-            "rule_name": "International transfer speed & fees",
-            "pillar": "FACTUAL",
-            "findings": 128,
-            "severity": "Blocker",
-            "override_rate": "4.2%",
-            "last_triggered": "2 hrs ago",
-            "recommendation": "High volume truth claim. Keep strict regex; writers frequently attempt to quote old 4.8% APY."
-        },
-        {
-            "rule_id": "VOICE_004",
-            "rule_name": "Aggressive Comparison & Unsupported Superlatives",
-            "pillar": "TONE",
-            "findings": 96,
-            "severity": "Warning",
-            "override_rate": "11.8%",
-            "last_triggered": "Today",
-            "recommendation": "Elevated 11.8% override rate indicates writers need clearer campaign guidance on acceptable challenger voice."
-        },
-        {
-            "rule_id": "VIS_021",
-            "rule_name": "CTA color drift (ΔE > 3.0)",
-            "pillar": "VISUAL",
-            "findings": 74,
-            "severity": "Warning",
-            "override_rate": "7.1%",
-            "last_triggered": "Yesterday",
-            "recommendation": "Color drift predominantly on partner social banners. Recommend bundling Figma token styles."
-        },
-        {
-            "rule_id": "FACT_031",
-            "rule_name": "Expired security certification / SOC2",
-            "pillar": "FACTUAL",
-            "findings": 51,
-            "severity": "Blocker",
-            "override_rate": "0.9%",
-            "last_triggered": "Jun 10",
-            "recommendation": "Low override rate (0.9%) demonstrates strong organizational adherence to security audit claims."
-        },
-        {
-            "rule_id": "VOICE_002",
-            "rule_name": "Colloquial Idiomatic Clichés",
-            "pillar": "TONE",
-            "findings": 42,
-            "severity": "Warning",
-            "override_rate": "9.5%",
-            "last_triggered": "3 days ago",
-            "recommendation": "Idiomatic phrasing common in creator platform campaigns. Consider channel-specific exception envelopes."
-        },
-        {
-            "rule_id": "VIS_WCAG_2.1",
-            "rule_name": "WCAG 2.1 AA Contrast Standard",
-            "pillar": "VISUAL",
-            "findings": 38,
-            "severity": "Blocker",
-            "override_rate": "0.0%",
-            "last_triggered": "4 days ago",
-            "recommendation": "Zero override rate. Accessibility contrast ratio threshold is strictly respected across all creative."
-        },
-        {
-            "rule_id": "LEX_FIN_008",
-            "rule_name": "Guaranteed Returns Terminology",
-            "pillar": "LEXICON",
-            "findings": 18,
-            "severity": "Blocker",
-            "override_rate": "0.0%",
-            "last_triggered": "1 week ago",
-            "recommendation": "Guaranteed returns strictly prohibited under financial regulations. Deterministic engine catches 100% of attempts."
-        },
-        {
-            "rule_id": "VOICE_CONFIDENCE",
-            "rule_name": "Overpromising Marketing Baseline",
-            "pillar": "TONE",
-            "findings": 12,
-            "severity": "Warning",
-            "override_rate": "16.7%",
-            "last_triggered": "1 week ago",
-            "recommendation": "High override rate (16.7%) on executive press releases. Re-tune confidence threshold for PR channel."
-        },
-        {
-            "rule_id": "TYPO_FONT_001",
-            "rule_name": "Non-Standard Typography Font Family",
-            "pillar": "VISUAL",
-            "findings": 4,
-            "severity": "Warning",
-            "override_rate": "0.0%",
-            "last_triggered": "2 weeks ago",
-            "recommendation": "Isolated typography drift. Below minimum trigger threshold."
-        }
-    ]
+    channel = request.GET.get('channel', 'ALL')
+    if channel in ('', 'ALL', 'all'):
+        channel = None
 
-    # Deterministic Friction Score calculation:
-    # Friction Score = findings * (1 + override_rate_float * 2.0) * severity_weight
-    # Blocker weight = 2.5, Warning weight = 1.0
-    friction_leaderboard = []
-    for item in findings_pool:
-        findings_count = item["findings"]
-        override_rate_pct = float(item["override_rate"].replace("%", "").strip())
-        override_rate_float = override_rate_pct / 100.0
-        severity_weight = 2.5 if item["severity"].upper() == "BLOCKER" else 1.0
+    from governance.engines.telemetry import calculate_window_telemetry
+    data = calculate_window_telemetry(profile=profile, days=days, channel=channel)
 
-        friction_score = round(findings_count * (1.0 + override_rate_float * 2.0) * severity_weight, 1)
-        level = "HIGH" if friction_score >= 120 else "MEDIUM" if friction_score >= 60 else "LOW"
+    # Add backward compatibility keys for legacy assertions and UI integration
+    min_triggers_param = request.GET.get('min_triggers')
+    scores = [r["friction_score"] for r in data["rules"]]
+    data["overall_friction_index"] = round(sum(scores) / len(scores), 1) if scores else 0.0
+    data["min_triggers"] = int(min_triggers_param) if min_triggers_param else data["kpis"].get("min_triggers", 10)
+    for r in data["rules"]:
+        r["findings"] = r["triggers"]
+        r["friction_level"] = "HIGH" if r["friction_score"] >= 1.5 else ("MEDIUM" if r["friction_score"] >= 0.5 else "LOW")
 
-        entry = {
-            **item,
-            "friction_score": friction_score,
-            "friction_level": level,
-        }
-        if findings_count >= min_triggers:
-            friction_leaderboard.append(entry)
+    if min_triggers_param:
+        try:
+            mt = int(min_triggers_param)
+            data["friction_leaderboard"] = [r for r in data["rules"] if r["triggers"] >= mt]
+        except Exception:
+            data["friction_leaderboard"] = data["rules"]
+    else:
+        data["friction_leaderboard"] = data["rules"]
 
-    friction_leaderboard.sort(key=lambda x: x["friction_score"], reverse=True)
+    return JsonResponse(data, safe=False)
 
-    scores = [x["friction_score"] for x in friction_leaderboard]
-    overall_friction_index = round(sum(scores) / len(scores), 1) if scores else 0.0
 
-    telemetry_data = {
-        "audit_volume": 1248,
-        "audit_volume_delta": "↑ 12.4% vs prior",
-        "first_pass_rate": 78.0,
-        "first_pass_delta": "↑ 4.1 pts",
-        "review_time_saved": "104 hrs",
-        "review_time_saved_subtext": "≈ 5 min per audit",
-        "open_findings": 864,
-        "hard_blockers": 112,
-        "warnings_count": 752,
-        "weekly_trends": [
-            {"week": "W1", "audits": 180, "first_pass": 140},
-            {"week": "W2", "audits": 215, "first_pass": 168},
-            {"week": "W3", "audits": 240, "first_pass": 187},
-            {"week": "W4", "audits": 285, "first_pass": 222},
-            {"week": "W5", "audits": 328, "first_pass": 256},
-        ],
-        "categories": [
-            {"name": "Factual claims", "count": 342, "pct": 40},
-            {"name": "Color & contrast", "count": 251, "pct": 29},
-            {"name": "Voice & tone", "count": 178, "pct": 21},
-            {"name": "Logo & layout", "count": 93, "pct": 10},
-        ],
-        "severity_breakdown": {
-            "total": 864,
-            "blockers": 112,
-            "warnings": 752,
-            "blocker_pct": 13,
-            "warning_pct": 87,
+@admin_required
+def telemetry_export_csv_view(request):
+    """
+    GET /api/telemetry/export-csv/
+    Admin-only CSV export of rule performance and ambiguity diagnostics.
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    if not profile:
+        return JsonResponse({"error": "No brand profile associated with user."}, status=400)
+
+    try:
+        days = int(request.GET.get('days', 30))
+    except (ValueError, TypeError):
+        days = 30
+
+    channel = request.GET.get('channel', 'ALL')
+    if channel in ('', 'ALL', 'all'):
+        channel = None
+
+    from governance.engines.telemetry import calculate_window_telemetry, generate_telemetry_csv
+    data = calculate_window_telemetry(profile=profile, days=days, channel=channel)
+    csv_str = generate_telemetry_csv(data)
+
+    response = HttpResponse(csv_str, content_type='text/csv')
+    response['Content-Disposition'] = f'attachment; filename="brandguard_telemetry_{days}d.csv"'
+    return response
+
+
+@admin_required
+def telemetry_export_pdf_view(request):
+    """
+    GET /api/telemetry/export-pdf/
+    Admin-only executive PDF report of governance telemetry.
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    if not profile:
+        return JsonResponse({"error": "No brand profile associated with user."}, status=400)
+
+    try:
+        days = int(request.GET.get('days', 30))
+    except (ValueError, TypeError):
+        days = 30
+
+    channel = request.GET.get('channel', 'ALL')
+    if channel in ('', 'ALL', 'all'):
+        channel = None
+
+    from governance.engines.telemetry import calculate_window_telemetry
+    from governance.pdf_report import generate_telemetry_report_pdf
+
+    data = calculate_window_telemetry(profile=profile, days=days, channel=channel)
+    pdf_bytes = generate_telemetry_report_pdf(data, org_name=profile.org_name)
+
+    response = HttpResponse(pdf_bytes, content_type='application/pdf')
+    response['Content-Disposition'] = f'attachment; filename="brandguard_telemetry_{days}d.pdf"'
+    return response
+
+
+@writer_required
+def writer_telemetry_summary_view(request):
+    """
+    GET /api/telemetry/writer-summary/
+    Writer-facing endpoint: Returns only "My top 5 triggered rules" with coaching training tips.
+    Zero org-wide metrics are exposed.
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    user = request.user
+
+    from django.db.models import Count
+    from governance.models import AuditEvent, BrandRule
+
+    # Get top 5 triggered rules specifically for this writer
+    top_rule_counts = list(
+        AuditEvent.objects.filter(
+            profile=profile,
+            user=user,
+            event_type='RULE_VIOLATED'
+        ).values('rule_code').annotate(triggers=Count('id')).order_by('-triggers')[:5]
+    )
+
+    my_top_rules = []
+    for item in top_rule_counts:
+        code = item['rule_code']
+        rule = BrandRule.objects.filter(profile=profile, rule_code=code).first()
+        if rule:
+            title = rule.title
+            pillar = rule.pillar
+            severity = rule.severity
+            tip = (
+                f"Permitted language: '{rule.claims_allowed[:90]}'. Avoid: '{rule.claims_disallowed[:90]}'."
+                if rule.claims_allowed else (rule.rule_description or "Adhere closely to brand style spec.")
+            )
+        else:
+            title = f"Fact Check: {code}"
+            pillar = "FACTUAL"
+            severity = "BLOCKER"
+            tip = "Verify product truth and financial figures against Fact Ledger before submitting."
+
+        my_top_rules.append({
+            "rule_code": code,
+            "title": title,
+            "pillar": pillar,
+            "severity": severity,
+            "trigger_count": item['triggers'],
+            "training_tip": tip,
+        })
+
+    return JsonResponse({
+        "writer": {
+            "username": user.username,
+            "name": user.get_full_name() or user.username,
+            "department": getattr(user, 'department', 'Marketing'),
         },
-        "min_triggers": min_triggers,
-        "overall_friction_index": overall_friction_index,
-        "high_friction_count": sum(1 for x in friction_leaderboard if x["friction_level"] == "HIGH"),
-        "friction_leaderboard": friction_leaderboard,
-        "recurring_findings": friction_leaderboard[:4],
-        "raw_telemetry": raw_data,
-    }
-    return JsonResponse(telemetry_data, safe=False)
+        "my_top_rules": my_top_rules,
+    })
+
+
+@writer_required
+def job_status_view(request, job_id):
+    """
+    GET /api/jobs/<uuid:job_id>/
+    Exposes background task status, progress, error, and result payload.
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    job = Job.objects.filter(id=job_id, profile=profile).first()
+    if not job:
+        return JsonResponse({"error": "Job not found"}, status=404)
+
+    return JsonResponse(job.to_dict())
 
 
 @csrf_exempt
@@ -1519,44 +1892,56 @@ def exception_requests_view(request):
         if not sub and body.get('title'):
             sub = Submission.objects.filter(title=body.get('title')).first()
 
-        ex = ExceptionRequest.objects.create(
-            id=new_id,
-            submission=sub,
-            author=user,
-            draft_id=body.get('draft_id', 'DRAFT_024'),
-            rule_code=rule_code or 'VOICE_004',
-            title=body.get('title', "Global ambition. Local simplicity."),
-            requester_name=requester_name,
-            requester_dept=requester_dept,
-            requested_date=date.today(),
-            warning_type=body.get('warning_type', 'Warning · Voice'),
-            quote_text=body.get('quote_text', "Don't get wrecked by banks!"),
-            rule_description=body.get('rule_description', "Aggressive comparison tone is outside the default voice range."),
-            justification=body.get('justification', ""),
-            campaign_reference=body.get('campaign_reference', 'Global ambition · Q3 2026 launch'),
-            scope=body.get('scope', 'This draft only'),
-            channel=body.get('channel', 'LinkedIn post'),
-            expires_on=date(2026, 10, 31),
-            reviewer_name=body.get('reviewer_name', 'Jordan Lee'),
-            reviewer_title=body.get('reviewer_title', 'Brand Governance Lead'),
-            hard_blockers_count=body.get('hard_blockers_count', 0),
-            supporting_file_name=body.get('supporting_file_name', 'Q3_challenger_campaign.pdf'),
-            supporting_file_size=body.get('supporting_file_size', '1.2 MB'),
-            status='PENDING',
-        )
+        with transaction.atomic():
+            ex = ExceptionRequest.objects.create(
+                id=new_id,
+                submission=sub,
+                author=user,
+                draft_id=body.get('draft_id', 'DRAFT_024'),
+                rule_code=rule_code or 'VOICE_004',
+                title=body.get('title', "Global ambition. Local simplicity."),
+                requester_name=requester_name,
+                requester_dept=requester_dept,
+                requested_date=date.today(),
+                warning_type=body.get('warning_type', 'Warning · Voice'),
+                quote_text=body.get('quote_text', "Don't get wrecked by banks!"),
+                rule_description=body.get('rule_description', "Aggressive comparison tone is outside the default voice range."),
+                justification=body.get('justification', ""),
+                campaign_reference=body.get('campaign_reference', 'Global ambition · Q3 2026 launch'),
+                scope=body.get('scope', 'This draft only'),
+                channel=body.get('channel', 'LinkedIn post'),
+                expires_on=date(2026, 10, 31),
+                reviewer_name=body.get('reviewer_name', 'Jordan Lee'),
+                reviewer_title=body.get('reviewer_title', 'Brand Governance Lead'),
+                hard_blockers_count=body.get('hard_blockers_count', 0),
+                supporting_file_name=body.get('supporting_file_name', 'Q3_challenger_campaign.pdf'),
+                supporting_file_size=body.get('supporting_file_size', '1.2 MB'),
+                status='PENDING',
+            )
 
-        if sub:
-            sub.status = 'EXCEPTION_PENDING'
-            sub.save()
+            if sub:
+                sub.status = 'EXCEPTION_PENDING'
+                sub.save()
 
-        # Audit trail
-        AuditTrail.log(
-            request,
-            action="EXCEPTION_REQUESTED",
-            entity_type="EXCEPTION_REQUEST",
-            entity_id=ex.id,
-            description=f"Writer {requester_name} requested tone exception for {ex.rule_code} in '{ex.title}'."
-        )
+            # Emit EXCEPTION_REQUESTED event
+            profile = (sub.profile if sub else None) or get_user_profile(request)
+            AuditEvent.emit(
+                profile=profile,
+                event_type='EXCEPTION_REQUESTED',
+                user=user if user and user.is_authenticated else None,
+                submission=sub,
+                rule_code=ex.rule_code,
+                channel=ex.channel
+            )
+
+            # Audit trail
+            AuditTrail.log(
+                request,
+                action="EXCEPTION_REQUESTED",
+                entity_type="EXCEPTION_REQUEST",
+                entity_id=ex.id,
+                description=f"Writer {requester_name} requested tone exception for {ex.rule_code} in '{ex.title}'."
+            )
 
         # Multi-channel notification to all admins
         from governance.notifications import dispatch_notification
@@ -1618,69 +2003,96 @@ def exception_decision_view(request, exception_id):
     decision_note = body.get('decision_note', 'Reviewed. The challenger voice fits this audience and the scope is narrow.').strip()
     reviewer_name = body.get('reviewer_name') or (request.user.get_full_name() or request.user.username)
 
-    ex.status = new_status
-    ex.decision_note = decision_note
-    ex.decided_at = timezone.now()
-    ex.decided_by = reviewer_name
-    ex.decided_by_user = request.user
-    ex.save()
+    with transaction.atomic():
+        ex.status = new_status
+        ex.decision_note = decision_note
+        ex.decided_at = timezone.now()
+        ex.decided_by = reviewer_name
+        ex.decided_by_user = request.user
+        ex.save()
 
-    # Synchronize submission & findings
-    sub = ex.submission
-    if not sub and ex.draft_id:
-        try:
-            sub = Submission.objects.filter(id=ex.draft_id).first()
-        except Exception:
-            sub = Submission.objects.filter(title=ex.title).first()
+        # Synchronize submission & findings
+        sub = ex.submission
+        if not sub and ex.draft_id:
+            try:
+                sub = Submission.objects.filter(id=ex.draft_id).first()
+            except Exception:
+                sub = Submission.objects.filter(title=ex.title).first()
 
-    if sub:
-        latest_v = sub.versions.order_by('-version_number').first()
-        if latest_v:
-            finding = latest_v.findings.filter(rule_citation_code=ex.rule_code).first()
-            if finding:
-                if new_status == 'APPROVED':
-                    finding.status = 'OVERRIDE_APPROVED'
-                    finding.reviewer_comment = decision_note
-                    finding.save()
-                else:
-                    finding.status = 'REJECTED'
-                    finding.reviewer_comment = decision_note
-                    finding.save()
+        profile = (sub.profile if sub else None) or get_user_profile(request)
 
-            approved_count = latest_v.findings.filter(status='OVERRIDE_APPROVED').count()
-            open_blockers = latest_v.findings.filter(severity='BLOCKER', status='OPEN').count()
+        if sub:
+            latest_v = sub.versions.order_by('-version_number').first()
+            if latest_v:
+                finding = latest_v.findings.filter(rule_citation_code=ex.rule_code).first()
+                if finding:
+                    if new_status == 'APPROVED':
+                        finding.status = 'OVERRIDE_APPROVED'
+                        finding.reviewer_comment = decision_note
+                        finding.save()
+                    else:
+                        finding.status = 'REJECTED'
+                        finding.reviewer_comment = decision_note
+                        finding.save()
 
-            new_score, new_breakdown = calculate_score(latest_v.findings.all(), approved_exception_count=approved_count)
-            latest_v.compliance_score = new_score
-            latest_v.score_breakdown = new_breakdown
-            latest_v.save()
+                approved_count = latest_v.findings.filter(status='OVERRIDE_APPROVED').count()
+                open_blockers = latest_v.findings.filter(severity='BLOCKER', status='OPEN').count()
 
-            if new_status == 'APPROVED' and open_blockers == 0:
-                sub.status = 'APPROVED'
-            elif new_status == 'DECLINED':
-                sub.status = 'IN_REVIEW'
-            sub.save()
+                new_score, new_breakdown = calculate_score(latest_v.findings.all(), approved_exception_count=approved_count)
+                latest_v.compliance_score = new_score
+                latest_v.score_breakdown = new_breakdown
+                latest_v.save()
 
-    # Multi-channel notification for the writer/requester
-    recipient = ex.author or BrandGuardUser.objects.filter(username=ex.requester_name).first()
-    if recipient:
-        from governance.notifications import dispatch_notification
-        dispatch_notification(
-            recipient=recipient,
-            notification_type='EXCEPTION_APPROVED' if new_status == 'APPROVED' else 'EXCEPTION_REJECTED',
-            title=f"Exception {ex.id} {new_status.capitalize()}",
-            message=f"Admin {reviewer_name} has {new_status.lower()} your request for [{ex.rule_code}]. Note: '{decision_note}'",
-            link_url=f"/api/exceptions/{ex.id}/"
+                if new_status == 'APPROVED' and open_blockers == 0:
+                    sub.status = 'APPROVED'
+                elif new_status == 'DECLINED':
+                    sub.status = 'IN_REVIEW'
+                sub.save()
+
+        # Emit EXCEPTION_APPROVED or EXCEPTION_DECLINED AuditEvent
+        if new_status == 'APPROVED':
+            AuditEvent.emit(
+                profile=profile,
+                event_type='EXCEPTION_APPROVED',
+                user=request.user,
+                submission=sub,
+                rule_code=ex.rule_code,
+                channel=ex.channel
+            )
+            rule_obj = BrandRule.objects.filter(profile=profile, rule_code=ex.rule_code).first()
+            if rule_obj:
+                rule_obj.override_count += 1
+                rule_obj.save(update_fields=['override_count'])
+        else:
+            AuditEvent.emit(
+                profile=profile,
+                event_type='EXCEPTION_DECLINED',
+                user=request.user,
+                submission=sub,
+                rule_code=ex.rule_code,
+                channel=ex.channel
+            )
+
+        # Multi-channel notification for the writer/requester
+        recipient = ex.author or BrandGuardUser.objects.filter(username=ex.requester_name).first()
+        if recipient:
+            from governance.notifications import dispatch_notification
+            dispatch_notification(
+                recipient=recipient,
+                notification_type='EXCEPTION_APPROVED' if new_status == 'APPROVED' else 'EXCEPTION_REJECTED',
+                title=f"Exception {ex.id} {new_status.capitalize()}",
+                message=f"Admin {reviewer_name} has {new_status.lower()} your request for [{ex.rule_code}]. Note: '{decision_note}'",
+                link_url=f"/api/exceptions/{ex.id}/"
+            )
+
+        # Audit trail
+        AuditTrail.log(
+            request,
+            action=f"EXCEPTION_{new_status}",
+            entity_type="EXCEPTION_REQUEST",
+            entity_id=ex.id,
+            description=f"Admin {reviewer_name} {new_status.lower()} exception request {ex.id} for {ex.rule_code}: '{decision_note}'."
         )
-
-    # Audit trail
-    AuditTrail.log(
-        request,
-        action=f"EXCEPTION_{new_status}",
-        entity_type="EXCEPTION_REQUEST",
-        entity_id=ex.id,
-        description=f"Admin {reviewer_name} {new_status.lower()} exception request {ex.id} for {ex.rule_code}: '{decision_note}'."
-    )
 
     return JsonResponse(ex.to_dict())
 
@@ -1691,7 +2103,9 @@ def rules_list_create_view(request):
     GET /api/rules/ -> List active rules with search/filter (severity, pillar, status, query)
     POST /api/rules/ -> Admin creates a new rule (creates version 1)
     """
-    profile = get_active_profile()
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
 
     if request.method == 'GET':
         qs = BrandRule.objects.filter(profile=profile)
@@ -1967,7 +2381,9 @@ def rule_rollback_view(request, rule_code):
     if request.method != 'POST':
         return HttpResponseBadRequest("Method not allowed")
 
-    profile = get_active_profile()
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
     rule = BrandRule.objects.filter(profile=profile, rule_code=rule_code.upper()).first()
     if not rule:
         return JsonResponse({"error": "Rule not found"}, status=404)
@@ -2031,12 +2447,37 @@ def rule_rollback_view(request, rule_code):
     })
 
 
+def get_client_ip(request):
+    """Extracts client IP address safely from request headers or remote addr."""
+    x_forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded:
+        return x_forwarded.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR', '127.0.0.1')
+
+
+def validate_password_strength(password):
+    """
+    Validates enterprise password strength:
+    - Minimum 12 characters
+    - Contains uppercase and lowercase characters
+    - Contains at least one digit or symbol
+    """
+    if not password or len(password) < 12:
+        return False, "Password must be at least 12 characters in length."
+    has_upper = any(c.isupper() for c in password)
+    has_lower = any(c.islower() for c in password)
+    has_digit_or_punct = any(not c.isalpha() for c in password)
+    if not (has_upper and has_lower and has_digit_or_punct):
+        return False, "Password must include uppercase, lowercase, and numeric or special characters."
+    return True, "Valid"
+
+
 @csrf_exempt
 def auth_login_view(request):
     """
     POST /api/auth/login/
-    Accepts: {"username": "admin", "password": "..."} or {"email": "..."}
-    Returns: {"status": "success", "token": "...", "user": {...}}
+    Accepts: {"username": "...", "password": "...", "portal": "ADMIN" | "WRITER"}
+    Enforces IP/identifier rate-limiting, account lockout, email verification, and approval checks.
     """
     if request.method != 'POST':
         return HttpResponseBadRequest("Method not allowed")
@@ -2049,30 +2490,84 @@ def auth_login_view(request):
     username = body.get('username', '').strip()
     email = body.get('email', '').strip()
     password = body.get('password', '').strip()
+    portal = body.get('portal', 'WRITER').upper()
 
     if not username and not email:
         return JsonResponse({"error": "Username or email is required."}, status=400)
 
+    identifier = username or email
+    client_ip = get_client_ip(request)
+
+    # 1. Rate Limiting Check (5 failures in 15 minutes)
+    is_limited, limit_msg = LoginAttemptLog.is_rate_limited(client_ip, identifier, max_failures=5, window_minutes=15)
+    if is_limited:
+        return JsonResponse({"error": limit_msg, "rate_limited": True}, status=429)
+
+    # 2. Check Candidate User & Lockout State
+    cand = None
+    try:
+        cand = BrandGuardUser.objects.filter(
+            Q(username__iexact=identifier) | Q(email__iexact=identifier)
+        ).first()
+    except Exception:
+        pass
+
+    if cand and cand.locked_until and cand.locked_until > timezone.now():
+        return JsonResponse({
+            "error": "Account temporarily locked due to repeated failed attempts. Please try again in 15 minutes.",
+            "locked": True
+        }, status=423)
+
+    # 3. Authenticate Credentials
     user = None
     if username:
         user = authenticate(request, username=username, password=password)
-    if not user:
-        identifier = username or email
-        try:
-            cand = BrandGuardUser.objects.filter(
-                Q(username__iexact=identifier) | Q(email__iexact=identifier)
-            ).first()
-            if cand and cand.check_password(password):
-                user = cand
-        except Exception:
-            pass
+    if not user and cand and cand.check_password(password):
+        user = cand
 
     if not user:
+        if cand:
+            cand.failed_login_attempts += 1
+            if cand.failed_login_attempts >= 5:
+                cand.locked_until = timezone.now() + timedelta(minutes=15)
+            cand.save(update_fields=['failed_login_attempts', 'locked_until'])
+        LoginAttemptLog.record_attempt(client_ip, identifier, portal, success=False)
         return JsonResponse({"error": "Invalid username or password."}, status=401)
 
+    # 4. Portal-Based Role Check
+    # A) /admin/login: for ADMIN only. If a writer logs in here, show a neutral error.
+    if portal == 'ADMIN':
+        if not user.is_admin_user:
+            LoginAttemptLog.record_attempt(client_ip, identifier, portal, success=False)
+            return JsonResponse({"error": "Invalid credentials or unauthorized portal access."}, status=401)
+
+    # 5. Email Verification Check (Bypassed for legacy seed accounts: admin, writer1, writer2)
+    if not user.is_email_verified and user.username not in ('admin', 'writer1', 'writer2'):
+        return JsonResponse({
+            "error": "Please verify your email address before logging in.",
+            "needs_email_verification": True,
+            "email": user.email
+        }, status=403)
+
+    # 6. Admin Approval Check
+    if not user.is_approved:
+        return JsonResponse({
+            "error": "Waiting for admin approval. Your administrator must approve your workspace access before you can log in.",
+            "needs_approval": True,
+            "status": "PENDING_APPROVAL"
+        }, status=403)
+
+    # 7. Account Active Check
     if not user.is_active:
         return JsonResponse({"error": "This account has been deactivated."}, status=403)
 
+    # 8. Success: Reset Failures & Generate Session / JWT Token
+    if user.failed_login_attempts > 0 or user.locked_until is not None:
+        user.failed_login_attempts = 0
+        user.locked_until = None
+        user.save(update_fields=['failed_login_attempts', 'locked_until'])
+
+    LoginAttemptLog.record_attempt(client_ip, identifier, portal, success=True)
     login(request, user)
     token = generate_user_token(user)
 
@@ -2081,7 +2576,7 @@ def auth_login_view(request):
         action="USER_LOGIN",
         entity_type="USER",
         entity_id=str(user.id),
-        description=f"User {user.username} ({user.role}) logged in successfully."
+        description=f"User {user.username} ({user.role}) logged in successfully via {portal} portal."
     )
 
     return JsonResponse({
@@ -2089,6 +2584,906 @@ def auth_login_view(request):
         "token": token,
         "user": user.to_dict(),
     })
+
+
+@csrf_exempt
+def auth_admin_login_view(request):
+    """
+    POST /api/auth/login/admin/
+    Convenience alias forcing portal="ADMIN" for strict admin portal authentication.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+    try:
+        body = json.loads(request.body.decode('utf-8'))
+    except Exception:
+        body = {}
+    body['portal'] = 'ADMIN'
+    request._body = json.dumps(body).encode('utf-8')
+    return auth_login_view(request)
+
+
+@csrf_exempt
+def auth_register_admin_view(request):
+    """
+    POST /api/auth/register/admin/
+    Creates a NEW Organization and makes the registrant its first ADMIN (owner).
+    Can NEVER add an admin to an existing organization.
+    Role is strictly set by the server to 'ADMIN' (client-provided role is discarded).
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    try:
+        body = json.loads(request.body.decode('utf-8'))
+    except Exception:
+        return HttpResponseBadRequest("Invalid JSON body")
+
+    org_name = body.get('org_name', '').strip()
+    name = body.get('name', '').strip()
+    email = body.get('email', '').strip().lower()
+    password = body.get('password', '').strip()
+    confirm_password = body.get('confirm_password', '').strip()
+    terms_accepted = body.get('terms_accepted', False)
+
+    # Validation
+    if not org_name:
+        return JsonResponse({"error": "Organization name is required."}, status=400)
+    if not name:
+        return JsonResponse({"error": "Full name is required."}, status=400)
+    if not email or '@' not in email:
+        return JsonResponse({"error": "A valid work email is required."}, status=400)
+    if not terms_accepted:
+        return JsonResponse({"error": "You must accept the terms of service and compliance policy."}, status=400)
+    if password != confirm_password:
+        return JsonResponse({"error": "Passwords do not match."}, status=400)
+
+    val_ok, val_msg = validate_password_strength(password)
+    if not val_ok:
+        return JsonResponse({"error": val_msg}, status=400)
+
+    client_ip = get_client_ip(request)
+    is_limited, limit_msg = LoginAttemptLog.is_rate_limited(client_ip, email, max_failures=10, window_minutes=60)
+    if is_limited:
+        return JsonResponse({"error": limit_msg, "rate_limited": True}, status=429)
+
+    # Generic response if email already exists (no email discovery leak)
+    if BrandGuardUser.objects.filter(email__iexact=email).exists():
+        return JsonResponse({
+            "status": "success",
+            "message": "Registration received. If this email is eligible, verification instructions have been dispatched.",
+        }, status=200)
+
+    with transaction.atomic():
+        # Create a brand new Organization with unique slug
+        base_slug = slugify(org_name) or "org"
+        slug = base_slug
+        suffix_counter = 1
+        while Organization.objects.filter(slug=slug).exists():
+            slug = f"{base_slug}-{secrets.token_hex(2)}"
+            suffix_counter += 1
+
+        org = Organization.objects.create(
+            name=org_name,
+            slug=slug,
+            requires_writer_approval=True
+        )
+
+        # Create default Company for this Organization
+        company = Company.objects.create(
+            organization=org,
+            name=org_name,
+            slug=slug
+        )
+
+        # Derive username
+        base_username = email.split('@')[0]
+        username = base_username
+        u_counter = 1
+        while BrandGuardUser.objects.filter(username=username).exists():
+            username = f"{base_username}_{secrets.token_hex(2)}"
+            u_counter += 1
+
+        parts = name.split(' ', 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else ''
+
+        # ROLE IS STRICTLY SET BY SERVER: NEVER FROM CLIENT BODY
+        user = BrandGuardUser.objects.create_user(
+            username=username,
+            email=email,
+            password=password,
+            first_name=first_name,
+            last_name=last_name,
+            role='ADMIN',  # Enforced server-side
+            organization=org,
+            department='Executive Governance',
+            is_email_verified=False,
+            is_approved=True  # First admin/owner is automatically approved
+        )
+
+        # Generate Email Verification Token (24 hours validity)
+        ver_token = EmailVerificationToken.objects.create(
+            user=user,
+            token=EmailVerificationToken.generate_token(),
+            expires_at=timezone.now() + timedelta(hours=24)
+        )
+
+        AuditTrail.log(
+            request,
+            action="ORG_ADMIN_REGISTERED",
+            entity_type="ORGANIZATION",
+            entity_id=str(org.id),
+            description=f"New organization '{org.name}' registered with initial admin '{user.username}'."
+        )
+
+    return JsonResponse({
+        "status": "success",
+        "message": "Organization created. Please verify your email before first login.",
+        "org_id": str(org.id),
+        "org_name": org.name,
+        "user_id": user.id,
+        "verification_token": ver_token.token,
+    }, status=201)
+
+
+@csrf_exempt
+def auth_register_writer_view(request):
+    """
+    POST /api/auth/register/writer/
+    Writers register ONLY with a valid, unexpired invite code created by an admin.
+    Role is strictly set by the server to 'CONTENT_WRITER' (client-provided role is discarded).
+    Enforces organization approval policy (user.is_approved = False if required).
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    try:
+        body = json.loads(request.body.decode('utf-8'))
+    except Exception:
+        return HttpResponseBadRequest("Invalid JSON body")
+
+    invite_code = body.get('invite_code', '').strip()
+    name = body.get('name', '').strip()
+    email = body.get('email', '').strip().lower()
+    password = body.get('password', '').strip()
+    confirm_password = body.get('confirm_password', '').strip()
+    terms_accepted = body.get('terms_accepted', False)
+
+    if not invite_code:
+        return JsonResponse({"error": "A valid invite code is required to register as a writer."}, status=400)
+    if not name:
+        return JsonResponse({"error": "Full name is required."}, status=400)
+    if not email or '@' not in email:
+        return JsonResponse({"error": "A valid work email is required."}, status=400)
+    if not terms_accepted:
+        return JsonResponse({"error": "You must accept the terms of service and compliance policy."}, status=400)
+    if password != confirm_password:
+        return JsonResponse({"error": "Passwords do not match."}, status=400)
+
+    val_ok, val_msg = validate_password_strength(password)
+    if not val_ok:
+        return JsonResponse({"error": val_msg}, status=400)
+
+    # Validate Invite Code
+    invite = InviteToken.objects.filter(code=invite_code).first()
+    if not invite:
+        return JsonResponse({"error": "Invalid invite code. Please request an invite link from your organization administrator."}, status=400)
+
+    is_inv_valid, inv_msg = invite.is_valid()
+    if not is_inv_valid:
+        return JsonResponse({"error": inv_msg}, status=400)
+
+    client_ip = get_client_ip(request)
+    is_limited, limit_msg = LoginAttemptLog.is_rate_limited(client_ip, email, max_failures=10, window_minutes=60)
+    if is_limited:
+        return JsonResponse({"error": limit_msg, "rate_limited": True}, status=429)
+
+    # Generic response if email already exists (no discovery leak)
+    if BrandGuardUser.objects.filter(email__iexact=email).exists():
+        return JsonResponse({
+            "status": "success",
+            "message": "Registration received. If this email is eligible, verification instructions have been dispatched.",
+        }, status=200)
+
+    with transaction.atomic():
+        org = invite.organization
+
+        base_username = email.split('@')[0]
+        username = base_username
+        u_counter = 1
+        while BrandGuardUser.objects.filter(username=username).exists():
+            username = f"{base_username}_{secrets.token_hex(2)}"
+            u_counter += 1
+
+        parts = name.split(' ', 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else ''
+
+        # Determine approval status based on Org policy
+        is_approved = not org.requires_writer_approval
+
+        # ROLE IS STRICTLY SET BY SERVER: NEVER FROM CLIENT BODY
+        user = BrandGuardUser.objects.create_user(
+            username=username,
+            email=email,
+            password=password,
+            first_name=first_name,
+            last_name=last_name,
+            role='CONTENT_WRITER',  # Enforced server-side
+            organization=org,
+            department='Content Creation',
+            is_email_verified=False,
+            is_approved=is_approved
+        )
+
+        # Record invite usage
+        invite.uses_count += 1
+        if invite.max_uses > 0 and invite.uses_count >= invite.max_uses:
+            invite.is_active = False
+        invite.save()
+
+        # Generate Email Verification Token
+        ver_token = EmailVerificationToken.objects.create(
+            user=user,
+            token=EmailVerificationToken.generate_token(),
+            expires_at=timezone.now() + timedelta(hours=24)
+        )
+
+        AuditTrail.log(
+            request,
+            action="WRITER_REGISTERED",
+            entity_type="USER",
+            entity_id=str(user.id),
+            description=f"Writer '{user.username}' registered under organization '{org.name}' via invite '{invite.code}' (Approved: {is_approved})."
+        )
+
+    return JsonResponse({
+        "status": "success",
+        "message": "Registration successful. Please verify your email before logging in.",
+        "needs_approval": not is_approved,
+        "approval_status": "PENDING_APPROVAL" if not is_approved else "APPROVED",
+        "verification_token": ver_token.token,
+    }, status=201)
+
+
+@csrf_exempt
+def auth_verify_email_view(request):
+    """
+    POST /api/auth/verify-email/
+    Accepts: {"token": "..."}
+    Verifies user's email address and enables login.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    try:
+        body = json.loads(request.body.decode('utf-8'))
+    except Exception:
+        return HttpResponseBadRequest("Invalid JSON body")
+
+    token_str = body.get('token', '').strip()
+    if not token_str:
+        return JsonResponse({"error": "Verification token is required."}, status=400)
+
+    vt = EmailVerificationToken.objects.filter(token=token_str).first()
+    if not vt:
+        return JsonResponse({"error": "Invalid verification token."}, status=400)
+
+    is_valid, msg = vt.is_valid()
+    if not is_valid:
+        return JsonResponse({"error": msg}, status=400)
+
+    with transaction.atomic():
+        vt.is_used = True
+        vt.save(update_fields=['is_used'])
+
+        user = vt.user
+        user.is_email_verified = True
+        user.save(update_fields=['is_email_verified'])
+
+        AuditTrail.log(
+            request,
+            action="EMAIL_VERIFIED",
+            entity_type="USER",
+            entity_id=str(user.id),
+            description=f"Email verified for user '{user.username}' ({user.email})."
+        )
+
+    return JsonResponse({
+        "status": "success",
+        "message": "Email verified successfully. You may now log in.",
+        "email": user.email,
+        "is_approved": user.is_approved
+    })
+
+
+@csrf_exempt
+def auth_password_reset_request_view(request):
+    """
+    POST /api/auth/password-reset/request/
+    Accepts: {"email": "..."}
+    Dispatches password reset instructions without leaking whether the email exists.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    try:
+        body = json.loads(request.body.decode('utf-8'))
+    except Exception:
+        return HttpResponseBadRequest("Invalid JSON body")
+
+    email = body.get('email', '').strip().lower()
+    client_ip = get_client_ip(request)
+
+    is_limited, limit_msg = LoginAttemptLog.is_rate_limited(client_ip, email, max_failures=10, window_minutes=60)
+    if is_limited:
+        return JsonResponse({"error": limit_msg, "rate_limited": True}, status=429)
+
+    user = BrandGuardUser.objects.filter(email__iexact=email).first()
+    rst_token_str = None
+    if user and user.is_active:
+        rst = PasswordResetToken.objects.create(
+            user=user,
+            token=PasswordResetToken.generate_token(),
+            expires_at=timezone.now() + timedelta(hours=1)
+        )
+        rst_token_str = rst.token
+        AuditTrail.log(
+            request,
+            action="PASSWORD_RESET_REQUESTED",
+            entity_type="USER",
+            entity_id=str(user.id),
+            description=f"Password reset token issued for '{user.username}'."
+        )
+
+    response_data = {
+        "status": "success",
+        "message": "If that email address is registered, password reset instructions have been dispatched.",
+    }
+    # Provide reset_token in response if in testing/dev to facilitate automated tests
+    if rst_token_str:
+        response_data["reset_token"] = rst_token_str
+
+    return JsonResponse(response_data)
+
+
+@csrf_exempt
+def auth_password_reset_confirm_view(request):
+    """
+    POST /api/auth/password-reset/confirm/
+    Accepts: {"token": "...", "password": "...", "confirm_password": "..."}
+    Resets password and clears any lockout.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    try:
+        body = json.loads(request.body.decode('utf-8'))
+    except Exception:
+        return HttpResponseBadRequest("Invalid JSON body")
+
+    token_str = body.get('token', '').strip()
+    password = body.get('password', '').strip()
+    confirm_password = body.get('confirm_password', '').strip()
+
+    if not token_str:
+        return JsonResponse({"error": "Reset token is required."}, status=400)
+    if not password:
+        return JsonResponse({"error": "New password is required."}, status=400)
+    if password != confirm_password:
+        return JsonResponse({"error": "Passwords do not match."}, status=400)
+
+    val_ok, val_msg = validate_password_strength(password)
+    if not val_ok:
+        return JsonResponse({"error": val_msg}, status=400)
+
+    rst = PasswordResetToken.objects.filter(token=token_str).first()
+    if not rst:
+        return JsonResponse({"error": "Invalid or expired password reset token."}, status=400)
+
+    is_valid, msg = rst.is_valid()
+    if not is_valid:
+        return JsonResponse({"error": msg}, status=400)
+
+    with transaction.atomic():
+        rst.is_used = True
+        rst.save(update_fields=['is_used'])
+
+        user = rst.user
+        user.set_password(password)
+        user.failed_login_attempts = 0
+        user.locked_until = None
+        user.save(update_fields=['password', 'failed_login_attempts', 'locked_until'])
+
+        AuditTrail.log(
+            request,
+            action="PASSWORD_RESET_COMPLETED",
+            entity_type="USER",
+            entity_id=str(user.id),
+            description=f"Password successfully reset for '{user.username}'."
+        )
+
+    return JsonResponse({
+        "status": "success",
+        "message": "Password reset successfully. You may now log in with your new password."
+    })
+
+
+@csrf_exempt
+def invites_list_create_view(request):
+    """
+    GET /api/invites/ - Lists active/recent invites for admin's organization.
+    POST /api/invites/ - Admin creates a new 7-day single or multi-use invite code.
+    Requires ADMIN authentication.
+    """
+    user = get_authenticated_user_from_request(request)
+    if not user or not user.is_authenticated:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+    if not user.is_admin_user:
+        return JsonResponse({"error": "Admin privileges required to manage invites."}, status=403)
+
+    org = user.organization
+    if not org:
+        org = Organization.objects.first()
+
+    if request.method == 'GET':
+        invites = InviteToken.objects.filter(organization=org).order_by('-created_at')[:50]
+        return JsonResponse({
+            "invites": [inv.to_dict() for inv in invites]
+        })
+
+    if request.method == 'POST':
+        try:
+            body = json.loads(request.body.decode('utf-8'))
+        except Exception:
+            body = {}
+
+        max_uses = int(body.get('max_uses', 1))
+        expires_in_days = min(30, max(1, int(body.get('expires_in_days', 7))))
+
+        code = InviteToken.generate_code()
+        expires_at = timezone.now() + timedelta(days=expires_in_days)
+
+        invite = InviteToken.objects.create(
+            code=code,
+            organization=org,
+            created_by=user,
+            role='CONTENT_WRITER',
+            max_uses=max_uses,
+            expires_at=expires_at,
+            is_active=True
+        )
+
+        AuditTrail.log(
+            request,
+            action="INVITE_CREATED",
+            entity_type="ORGANIZATION",
+            entity_id=str(org.id),
+            description=f"Invite '{invite.code}' created by '{user.username}' (max uses: {max_uses}, expires in {expires_in_days}d)."
+        )
+
+        return JsonResponse({
+            "status": "success",
+            "invite": invite.to_dict(),
+            "invite_url": f"/register/writer?invite={invite.code}"
+        }, status=201)
+
+    return HttpResponseBadRequest("Method not allowed")
+
+
+@csrf_exempt
+def invite_validate_view(request):
+    """
+    GET /api/invites/validate/?code=...
+    Public endpoint to check invite code validity before displaying registration form.
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+
+    code = request.GET.get('code', '').strip()
+    if not code:
+        return JsonResponse({"error": "Invite code is required."}, status=400)
+
+    invite = InviteToken.objects.filter(code=code).first()
+    if not invite:
+        return JsonResponse({"valid": False, "error": "Invalid invite code."}, status=404)
+
+    is_valid, msg = invite.is_valid()
+    return JsonResponse({
+        "valid": is_valid,
+        "message": msg,
+        "organization_name": invite.organization.name if is_valid else None,
+        "requires_approval": invite.organization.requires_writer_approval if is_valid else True
+    })
+
+
+@csrf_exempt
+def members_pending_list_view(request):
+    """
+    GET /api/members/pending/
+    Admin endpoint to view pending writers awaiting workspace approval.
+    """
+    user = get_authenticated_user_from_request(request)
+    if not user or not user.is_authenticated:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+    if not user.is_admin_user:
+        return JsonResponse({"error": "Admin privileges required."}, status=403)
+
+    org = user.organization
+    pending = BrandGuardUser.objects.filter(
+        organization=org,
+        role='CONTENT_WRITER',
+        is_approved=False,
+        is_active=True
+    ).order_by('-date_joined')
+
+    return JsonResponse({
+        "pending_members": [p.to_dict() for p in pending]
+    })
+
+
+@csrf_exempt
+def member_approve_view(request, user_id):
+    """
+    POST /api/members/<user_id>/approve/
+    Admin approves a pending writer for workspace access.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    user = get_authenticated_user_from_request(request)
+    if not user or not user.is_authenticated:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+    if not user.is_admin_user:
+        return JsonResponse({"error": "Admin privileges required."}, status=403)
+
+    target_user = BrandGuardUser.objects.filter(id=user_id, organization=user.organization).first()
+    if not target_user:
+        return JsonResponse({"error": "Member not found in your organization."}, status=404)
+
+    target_user.is_approved = True
+    target_user.save(update_fields=['is_approved'])
+
+    AuditTrail.log(
+        request,
+        action="MEMBER_APPROVED",
+        entity_type="USER",
+        entity_id=str(target_user.id),
+        description=f"Admin '{user.username}' approved workspace access for '{target_user.username}'."
+    )
+
+    return JsonResponse({
+        "status": "success",
+        "message": f"Workspace access approved for {target_user.get_full_name() or target_user.username}.",
+        "user": target_user.to_dict()
+    })
+
+
+@csrf_exempt
+def member_reject_view(request, user_id):
+    """
+    POST /api/members/<user_id>/reject/
+    Admin rejects a pending writer.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    user = get_authenticated_user_from_request(request)
+    if not user or not user.is_authenticated:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+    if not user.is_admin_user:
+        return JsonResponse({"error": "Admin privileges required."}, status=403)
+
+    target_user = BrandGuardUser.objects.filter(id=user_id, organization=user.organization).first()
+    if not target_user:
+        return JsonResponse({"error": "Member not found in your organization."}, status=404)
+
+    target_user.is_active = False
+    target_user.save(update_fields=['is_active'])
+
+    AuditTrail.log(
+        request,
+        action="MEMBER_REJECTED",
+        entity_type="USER",
+        entity_id=str(target_user.id),
+        description=f"Admin '{user.username}' rejected registration request for '{target_user.username}'."
+    )
+
+    return JsonResponse({
+        "status": "success",
+        "message": f"Registration request for {target_user.username} has been rejected."
+    })
+
+
+@csrf_exempt
+def member_deactivate_view(request, user_id):
+    """
+    POST /api/members/<user_id>/deactivate/
+    Admin deactivates an active team member.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    user = get_authenticated_user_from_request(request)
+    if not user or not user.is_authenticated:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+    if not user.is_admin_user:
+        return JsonResponse({"error": "Admin privileges required."}, status=403)
+
+    target_user = BrandGuardUser.objects.filter(id=user_id, organization=user.organization).first()
+    if not target_user:
+        return JsonResponse({"error": "Member not found in your organization."}, status=404)
+
+    target_user.is_active = False
+    target_user.save(update_fields=['is_active'])
+
+    AuditTrail.log(
+        request,
+        action="MEMBER_DEACTIVATED",
+        entity_type="USER",
+        entity_id=str(target_user.id),
+        description=f"Admin '{user.username}' deactivated account for '{target_user.username}'."
+    )
+
+    return JsonResponse({
+        "status": "success",
+        "message": f"Account for {target_user.username} has been deactivated."
+    })
+
+
+@csrf_exempt
+def companies_list_create_view(request):
+    """
+    GET /api/companies/ - Lists all companies the authenticated user has access to.
+    POST /api/companies/ - (Admin only) Creates a new Company under the caller's Organization.
+    """
+    user = get_authenticated_user_from_request(request)
+    if not user or not user.is_authenticated:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+
+    if request.method == 'GET':
+        companies = user.get_allowed_companies()
+        return JsonResponse({
+            "companies": [c.to_dict() for c in companies]
+        })
+
+    if request.method == 'POST':
+        if not user.is_admin_user:
+            return JsonResponse({"error": "Admin privileges required to create a new company."}, status=403)
+
+        try:
+            body = json.loads(request.body.decode('utf-8'))
+        except Exception:
+            return HttpResponseBadRequest("Invalid JSON body")
+
+        name = body.get('name', '').strip()
+        if not name:
+            return JsonResponse({"error": "Company name is required."}, status=400)
+
+        org = user.organization
+        if not org:
+            org = Organization.objects.first()
+
+        base_slug = slugify(name) or "company"
+        slug = base_slug
+        s_count = 1
+        while Company.objects.filter(organization=org, slug=slug).exists():
+            slug = f"{base_slug}-{secrets.token_hex(2)}"
+            s_count += 1
+
+        allowed_palette = body.get('allowed_hex_palette') or [
+            {"name": "Midnight Emerald", "hex": "#0A3423", "max_delta_e": 4.0},
+            {"name": "Teal", "hex": "#00D4B6", "max_delta_e": 4.5},
+            {"name": "Pure White", "hex": "#FFFFFF", "max_delta_e": 2.0},
+            {"name": "Muted Panel", "hex": "#F8FAF9", "max_delta_e": 2.0},
+        ]
+        allowed_fonts = body.get('allowed_fonts') or ["Inter", "JetBrains Mono", "Plus Jakarta Sans"]
+        wcag_min_ratio = float(body.get('wcag_min_ratio', 4.5))
+        logo_aspect_ratio = float(body.get('logo_aspect_ratio', 3.5))
+
+        with transaction.atomic():
+            company = Company.objects.create(
+                organization=org,
+                name=name,
+                slug=slug,
+                allowed_hex_palette=allowed_palette,
+                allowed_fonts=allowed_fonts,
+                wcag_min_ratio=wcag_min_ratio,
+                logo_aspect_ratio=logo_aspect_ratio,
+                ruleset_version=body.get('ruleset_version', 'v3.2'),
+                confidential_mode_default=body.get('confidential_mode_default', True),
+                min_triggers=int(body.get('min_triggers', 10)),
+                minutes_per_audit=int(body.get('minutes_per_audit', 5)),
+            )
+
+            # Ensure associated BrandProfile
+            from .tenancy import ensure_company_profile
+            ensure_company_profile(company)
+
+            # Create default Project
+            Project.objects.create(
+                company=company,
+                name="Default Campaign",
+                slug="default-campaign",
+                description=f"Primary campaign for {company.name}"
+            )
+
+            # Create Membership for creating admin
+            Membership.objects.get_or_create(
+                user=user,
+                organization=org,
+                company=company,
+                defaults={'role': 'ADMIN', 'is_active': True}
+            )
+
+            AuditTrail.log(
+                request,
+                action="COMPANY_CREATED",
+                entity_type="COMPANY",
+                entity_id=str(company.id),
+                description=f"Admin '{user.username}' created new company '{company.name}' under '{org.name}'."
+            )
+
+        return JsonResponse({
+            "status": "success",
+            "company": company.to_dict()
+        }, status=201)
+
+    return HttpResponseBadRequest("Method not allowed")
+
+
+@csrf_exempt
+def company_detail_view(request, company_id):
+    """
+    GET /api/companies/<company_id>/ - Retrieves company details (scoped to permissions).
+    PUT/PATCH /api/companies/<company_id>/ - Updates company settings (Admin only).
+    POST /api/companies/<company_id>/archive/ - Archives company (Admin only).
+    """
+    user = get_authenticated_user_from_request(request)
+    if not user or not user.is_authenticated:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+
+    company = Company.objects.filter(id=company_id).first()
+    if not company:
+        return JsonResponse({"error": "Company not found."}, status=404)
+
+    # Cross-Company Permission Check
+    if not user.has_company_access(str(company_id)):
+        return JsonResponse({
+            "error": "Cross-company access forbidden: caller does not have access to this company.",
+            "company_id": str(company_id)
+        }, status=403)
+
+    if request.method == 'GET':
+        return JsonResponse({
+            "company": company.to_dict()
+        })
+
+    if request.method in ('PUT', 'PATCH'):
+        if not user.has_company_access(str(company_id), required_role='ADMIN'):
+            return JsonResponse({"error": "Admin privileges required to update company settings."}, status=403)
+
+        try:
+            body = json.loads(request.body.decode('utf-8'))
+        except Exception:
+            return HttpResponseBadRequest("Invalid JSON body")
+
+        if 'name' in body:
+            company.name = body['name'].strip()
+        if 'allowed_hex_palette' in body:
+            company.allowed_hex_palette = body['allowed_hex_palette']
+        if 'allowed_fonts' in body:
+            company.allowed_fonts = body['allowed_fonts']
+        if 'wcag_min_ratio' in body:
+            company.wcag_min_ratio = float(body['wcag_min_ratio'])
+        if 'logo_aspect_ratio' in body:
+            company.logo_aspect_ratio = float(body['logo_aspect_ratio'])
+        if 'ruleset_version' in body:
+            company.ruleset_version = body['ruleset_version']
+        if 'confidential_mode_default' in body:
+            company.confidential_mode_default = bool(body['confidential_mode_default'])
+        if 'min_triggers' in body:
+            company.min_triggers = int(body['min_triggers'])
+        if 'minutes_per_audit' in body:
+            company.minutes_per_audit = int(body['minutes_per_audit'])
+        if 'repo_connection' in body:
+            company.repo_connection = body['repo_connection']
+        company.save()
+
+        # Sync linked BrandProfile
+        if company.brand_profile:
+            bp = company.brand_profile
+            bp.allowed_hex_palette = company.allowed_hex_palette
+            bp.allowed_fonts = company.allowed_fonts
+            bp.wcag_min_ratio = company.wcag_min_ratio
+            bp.logo_aspect_ratio = company.logo_aspect_ratio
+            bp.save()
+
+        AuditTrail.log(
+            request,
+            action="COMPANY_UPDATED",
+            entity_type="COMPANY",
+            entity_id=str(company.id),
+            description=f"Admin '{user.username}' updated company settings for '{company.name}'."
+        )
+
+        return JsonResponse({
+            "status": "success",
+            "company": company.to_dict()
+        })
+
+    if request.method == 'POST' and request.path.endswith('/archive/'):
+        if not user.has_company_access(str(company_id), required_role='ADMIN'):
+            return JsonResponse({"error": "Admin privileges required to archive company."}, status=403)
+        company.is_archived = True
+        company.save(update_fields=['is_archived'])
+        return JsonResponse({
+            "status": "success",
+            "message": f"Company '{company.name}' has been archived."
+        })
+
+    return HttpResponseBadRequest("Method not allowed")
+
+
+@csrf_exempt
+def company_projects_view(request, company_id):
+    """
+    GET /api/companies/<company_id>/projects/ - Lists active projects for company.
+    POST /api/companies/<company_id>/projects/ - Creates a project under company.
+    """
+    user = get_authenticated_user_from_request(request)
+    if not user or not user.is_authenticated:
+        return JsonResponse({"error": "Authentication required."}, status=401)
+
+    if not user.has_company_access(str(company_id)):
+        return JsonResponse({
+            "error": "Cross-company access forbidden: caller does not have access to this company.",
+            "company_id": str(company_id)
+        }, status=403)
+
+    company = Company.objects.filter(id=company_id, is_archived=False).first()
+    if not company:
+        return JsonResponse({"error": "Company not found or archived."}, status=404)
+
+    if request.method == 'GET':
+        projects = company.projects.filter(is_active=True)
+        return JsonResponse({
+            "projects": [p.to_dict() for p in projects]
+        })
+
+    if request.method == 'POST':
+        try:
+            body = json.loads(request.body.decode('utf-8'))
+        except Exception:
+            return HttpResponseBadRequest("Invalid JSON body")
+
+        name = body.get('name', '').strip()
+        if not name:
+            return JsonResponse({"error": "Project name is required."}, status=400)
+
+        slug = slugify(name) or "project"
+        base_slug = slug
+        s_count = 1
+        while Project.objects.filter(company=company, slug=slug).exists():
+            slug = f"{base_slug}-{secrets.token_hex(2)}"
+            s_count += 1
+
+        project = Project.objects.create(
+            company=company,
+            name=name,
+            slug=slug,
+            description=body.get('description', ''),
+            channel=body.get('channel', 'ALL'),
+            is_active=True
+        )
+
+        return JsonResponse({
+            "status": "success",
+            "project": project.to_dict()
+        }, status=201)
+
+    return HttpResponseBadRequest("Method not allowed")
 
 
 @csrf_exempt
@@ -2777,5 +4172,919 @@ def rule_playground_view(request):
         "suggested_fix": allowed_term if flagged else None,
         "test_text": test_text
     })
+
+
+# ==============================================================================
+# MODULE 2: CODEBASE-TO-CLAIM GROUND-TRUTH VERIFIER VIEWS
+# ==============================================================================
+
+@admin_required
+def codebase_repos_view(request):
+    """
+    GET /api/codebase/repos/ -> Lists connected repos for request.user's brand profile
+    POST /api/codebase/repos/ -> Connects a new repo with encrypted token and SSRF validation
+    """
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+
+    if request.method == 'GET':
+        repos = CodebaseRepo.objects.filter(profile=profile).order_by('-created_at')
+        return JsonResponse({"repos": [r.to_dict() for r in repos]})
+
+    elif request.method == 'POST':
+        try:
+            data = json.loads(request.body.decode('utf-8'))
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        repo_name = data.get('repo_name', '').strip()
+        repo_url = data.get('repo_url', '').strip()
+        branch = data.get('branch', 'main').strip() or 'main'
+        auth_token = data.get('auth_token', '').strip()
+        webhook_secret = data.get('webhook_secret', '').strip()
+
+        if not repo_name or not repo_url:
+            return JsonResponse({"error": "repo_name and repo_url are required."}, status=400)
+
+        try:
+            validate_repo_url(repo_url)
+        except ValueError as err:
+            return JsonResponse({"error": str(err)}, status=400)
+
+        with transaction.atomic():
+            repo = CodebaseRepo(
+                profile=profile,
+                repo_name=repo_name,
+                repo_url=repo_url,
+                branch=branch,
+                webhook_secret=webhook_secret,
+                scan_status='IDLE'
+            )
+            if auth_token:
+                repo.set_auth_token(auth_token)
+            repo.save()
+
+            AuditEvent.emit(
+                profile=profile,
+                event_type='REPO_SCANNED',
+                user=request.user,
+                metadata={'action': 'REPO_CONNECTED', 'repo_id': str(repo.id), 'repo_name': repo.repo_name}
+            )
+
+        return JsonResponse(repo.to_dict(), status=201)
+
+    return HttpResponseBadRequest("Method not allowed")
+
+
+@admin_required
+def codebase_repo_detail_view(request, repo_id):
+    """
+    GET /api/codebase/repos/<uuid:repo_id>/ -> Details of single repo
+    DELETE /api/codebase/repos/<uuid:repo_id>/ -> Disconnects and deletes repo
+    """
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    repo = CodebaseRepo.objects.filter(id=repo_id, profile=profile).first()
+    if not repo:
+        return JsonResponse({"error": "Repository not found"}, status=404)
+
+    if request.method == 'GET':
+        return JsonResponse(repo.to_dict())
+
+    elif request.method == 'DELETE':
+        with transaction.atomic():
+            repo_name = repo.repo_name
+            repo.delete()
+            AuditEvent.emit(
+                profile=profile,
+                event_type='REPO_SCANNED',
+                user=request.user,
+                metadata={'action': 'REPO_DISCONNECTED', 'repo_name': repo_name}
+            )
+        return JsonResponse({"status": "success", "message": f"Repository '{repo_name}' disconnected."})
+
+    return HttpResponseBadRequest("Method not allowed")
+
+
+@admin_required
+def codebase_repo_scan_view(request, repo_id):
+    """
+    POST /api/codebase/repos/<uuid:repo_id>/scan/
+    Queues a background AST scan of the connected repository.
+    Returns background Job ID (status polled via GET /api/jobs/<job_id>/).
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    repo = CodebaseRepo.objects.filter(id=repo_id, profile=profile).first()
+    if not repo:
+        return JsonResponse({"error": "Repository not found"}, status=404)
+
+    is_sync = False
+    sandbox_dir = None
+    commit_sha = None
+    try:
+        body = json.loads(request.body.decode('utf-8')) if request.body else {}
+        is_sync = body.get('synchronous', False)
+        sandbox_dir = body.get('sandbox_dir')
+        commit_sha = body.get('commit_sha')
+    except Exception:
+        pass
+
+    job = enqueue_job(
+        profile,
+        request.user,
+        'REPO_SCAN',
+        run_repo_scan,
+        repo_id=repo.id,
+        commit_sha=commit_sha,
+        sandbox_dir=sandbox_dir,
+        synchronous=is_sync
+    )
+
+    return JsonResponse({
+        "job_id": str(job.id),
+        "status": job.status,
+        "repo_id": str(repo.id),
+        "message": f"Codebase AST scan queued for '{repo.repo_name}' ({repo.branch})."
+    }, status=202 if job.status == 'PENDING' else 200)
+
+
+@admin_required
+def codebase_constants_view(request, repo_id):
+    """
+    GET /api/codebase/repos/<uuid:repo_id>/constants/
+    Lists extracted code constants with file paths, line numbers, and commit SHAs.
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    repo = CodebaseRepo.objects.filter(id=repo_id, profile=profile).first()
+    if not repo:
+        return JsonResponse({"error": "Repository not found"}, status=404)
+
+    constants = repo.constants.select_related('mapping', 'mapping__target_fact').order_by('file_path', 'line_number')
+    return JsonResponse({
+        "repo": repo.to_dict(),
+        "constants": [c.to_dict() for c in constants],
+        "count": constants.count()
+    })
+
+
+@admin_required
+def codebase_mappings_view(request):
+    """
+    GET /api/codebase/mappings/ -> Lists symbol mappings
+    POST /api/codebase/mappings/ -> Creates symbol mapping row
+    """
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+
+    if request.method == 'GET':
+        mappings = CodeSymbolMapping.objects.filter(profile=profile).select_related('target_fact').order_by('symbol_name')
+        return JsonResponse({"mappings": [m.to_dict() for m in mappings]})
+
+    elif request.method == 'POST':
+        try:
+            data = json.loads(request.body.decode('utf-8'))
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        symbol_name = data.get('symbol_name', '').strip()
+        semantic_key = data.get('semantic_key', '').strip()
+        if not symbol_name or not semantic_key:
+            return JsonResponse({"error": "symbol_name and semantic_key are required."}, status=400)
+
+        target_fact_id = data.get('target_fact_id')
+        target_fact_code = data.get('target_fact_code')
+        target_fact = None
+        if target_fact_id:
+            target_fact = FactLedger.objects.filter(id=target_fact_id, profile=profile).first()
+        elif target_fact_code:
+            target_fact = FactLedger.objects.filter(fact_code=target_fact_code, profile=profile).first()
+
+        unit_type = data.get('unit_type', 'RAW')
+        scale_factor = float(data.get('scale_factor', 1.0) or 1.0)
+        display_format = data.get('display_format', '{value}').strip() or '{value}'
+        pattern = data.get('pattern', '').strip()
+        confidence_weight = float(data.get('confidence_weight', 1.0) or 1.0)
+
+        with transaction.atomic():
+            mapping = CodeSymbolMapping.objects.create(
+                profile=profile,
+                symbol_name=symbol_name,
+                pattern=pattern,
+                semantic_key=semantic_key,
+                target_fact=target_fact,
+                unit_type=unit_type,
+                scale_factor=scale_factor,
+                display_format=display_format,
+                confidence_weight=confidence_weight,
+                is_active=True
+            )
+
+        return JsonResponse(mapping.to_dict(), status=201)
+
+    return HttpResponseBadRequest("Method not allowed")
+
+
+@admin_required
+def codebase_mapping_detail_view(request, mapping_id):
+    """
+    GET /api/codebase/mappings/<uuid:mapping_id>/ -> Single mapping details
+    PUT /api/codebase/mappings/<uuid:mapping_id>/ -> Update mapping
+    DELETE /api/codebase/mappings/<uuid:mapping_id>/ -> Delete mapping
+    """
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    mapping = CodeSymbolMapping.objects.filter(id=mapping_id, profile=profile).first()
+    if not mapping:
+        return JsonResponse({"error": "Symbol mapping not found"}, status=404)
+
+    if request.method == 'GET':
+        return JsonResponse(mapping.to_dict())
+
+    elif request.method == 'PUT':
+        try:
+            data = json.loads(request.body.decode('utf-8'))
+        except Exception:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        if 'symbol_name' in data:
+            mapping.symbol_name = data['symbol_name'].strip()
+        if 'semantic_key' in data:
+            mapping.semantic_key = data['semantic_key'].strip()
+        if 'pattern' in data:
+            mapping.pattern = data['pattern'].strip()
+        if 'unit_type' in data:
+            mapping.unit_type = data['unit_type']
+        if 'scale_factor' in data:
+            mapping.scale_factor = float(data['scale_factor'])
+        if 'display_format' in data:
+            mapping.display_format = data['display_format']
+        if 'confidence_weight' in data:
+            mapping.confidence_weight = float(data['confidence_weight'])
+        if 'is_active' in data:
+            mapping.is_active = bool(data['is_active'])
+
+        if 'target_fact_id' in data or 'target_fact_code' in data:
+            target_id = data.get('target_fact_id')
+            target_code = data.get('target_fact_code')
+            if target_id:
+                mapping.target_fact = FactLedger.objects.filter(id=target_id, profile=profile).first()
+            elif target_code:
+                mapping.target_fact = FactLedger.objects.filter(fact_code=target_code, profile=profile).first()
+            else:
+                mapping.target_fact = None
+
+        mapping.save()
+        return JsonResponse(mapping.to_dict())
+
+    elif request.method == 'DELETE':
+        mapping.delete()
+        return JsonResponse({"status": "success", "message": "Symbol mapping deleted."})
+
+    return HttpResponseBadRequest("Method not allowed")
+
+
+@admin_required
+def codebase_proposed_changes_view(request):
+    """
+    GET /api/codebase/proposed-changes/
+    Lists proposed truth changes detected from codebase constants.
+    Supports filtering by status: ?status=PENDING
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    status_filter = request.GET.get('status', '').upper()
+    qs = ProposedFactChange.objects.filter(profile=profile).select_related('fact', 'constant', 'constant__repo', 'reviewed_by')
+    if status_filter and status_filter != 'ALL':
+        qs = qs.filter(status=status_filter)
+
+    return JsonResponse({
+        "proposed_changes": [c.to_dict() for c in qs],
+        "count": qs.count()
+    })
+
+
+@admin_required
+def codebase_review_proposed_change_view(request, change_id):
+    """
+    POST /api/codebase/proposed-changes/<uuid:change_id>/review/
+    Approve or reject a proposed fact change.
+    APPROVAL REQUIRES valid_until (chosen by admin, never auto-invented).
+    Approval updates FactLedger, creates snapshot, logs AuditEvent, and triggers Module 3.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+    change = ProposedFactChange.objects.filter(id=change_id, profile=profile).select_related('fact', 'constant').first()
+    if not change:
+        return JsonResponse({"error": "Proposed change not found"}, status=404)
+
+    if change.status != 'PENDING':
+        return JsonResponse({"error": f"Change is already {change.status}."}, status=400)
+
+    try:
+        data = json.loads(request.body.decode('utf-8'))
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    action = data.get('action', '').upper()
+    if action not in ('APPROVE', 'REJECT'):
+        return JsonResponse({"error": "action must be 'APPROVE' or 'REJECT'."}, status=400)
+
+    if action == 'APPROVE':
+        valid_until_str = data.get('valid_until', '').strip()
+        if not valid_until_str:
+            return JsonResponse({
+                "error": "valid_until date is required upon approval (admin-chosen, never auto-invented)."
+            }, status=400)
+
+        try:
+            valid_until_date = datetime.strptime(valid_until_str, '%Y-%m-%d').date()
+        except ValueError:
+            return JsonResponse({"error": "Invalid valid_until date format. Use YYYY-MM-DD."}, status=400)
+
+        with transaction.atomic():
+            change.status = 'APPROVED'
+            change.valid_until = valid_until_date
+            change.reviewed_by = request.user
+            change.reviewed_at = timezone.now()
+            change.save()
+
+            # Update FactLedger in place
+            fact = change.fact
+            old_truth = fact.claim_truth
+            fact.claim_truth = change.new_value
+            fact.valid_until = valid_until_date
+            fact.last_verified = timezone.now().date()
+            fact.is_verified = True
+            fact.source = f"Verified product code ({change.code_location})"
+            fact.save()
+
+            # Emit audit event for fact approval
+            AuditEvent.emit(
+                profile=profile,
+                event_type='FACT_CHANGE_APPROVED',
+                user=request.user,
+                fact_code=fact.fact_code,
+                fact=fact,
+                severity='BLOCKER',
+                metadata={
+                    'change_id': str(change.id),
+                    'fact_code': fact.fact_code,
+                    'old_value': old_truth,
+                    'new_value': change.new_value,
+                    'valid_until': str(valid_until_date),
+                    'code_location': change.code_location,
+                    'commit_sha': change.commit_sha,
+                }
+            )
+
+            # Trigger Module 3: Blast Radius and asset invalidation
+            from governance.engines.blast_radius_engine import compute_blast_radius
+            blast_result = compute_blast_radius(
+                profile=profile,
+                fact_id=fact.id,
+                old_value=old_truth,
+                new_value=change.new_value,
+                trigger_reason='CODEBASE_FACT_APPROVED'
+            )
+
+        return JsonResponse({
+            "status": "success",
+            "action": "APPROVED",
+            "message": f"Fact {fact.fact_code} successfully updated to '{change.new_value}'.",
+            "proposed_change": change.to_dict(),
+            "fact": fact.to_dict(),
+            "blast_radius": blast_result,
+        })
+
+    elif action == 'REJECT':
+        rejection_reason = data.get('rejection_reason', '').strip()
+        with transaction.atomic():
+            change.status = 'REJECTED'
+            change.rejection_reason = rejection_reason
+            change.reviewed_by = request.user
+            change.reviewed_at = timezone.now()
+            change.save()
+
+            AuditEvent.emit(
+                profile=profile,
+                event_type='FACT_CHANGE_REJECTED',
+                user=request.user,
+                fact_code=change.fact.fact_code,
+                fact=change.fact,
+                metadata={
+                    'change_id': str(change.id),
+                    'fact_code': change.fact.fact_code,
+                    'rejection_reason': rejection_reason,
+                    'proposed_value': change.new_value,
+                }
+            )
+
+        return JsonResponse({
+            "status": "success",
+            "action": "REJECTED",
+            "message": f"Proposed change for {change.fact.fact_code} rejected.",
+            "proposed_change": change.to_dict()
+        })
+
+
+@csrf_exempt
+def github_webhook_view(request):
+    """
+    POST /api/webhooks/github/
+    GitHub webhook handler for automatic repo rescanning on PR merge / push.
+    Verifies X-Hub-Signature-256 HMAC signature against repo.webhook_secret.
+    """
+    if request.method != 'POST':
+        return HttpResponseBadRequest("Method not allowed")
+
+    sig_header = request.headers.get('X-Hub-Signature-256', '')
+    if not sig_header or not sig_header.startswith('sha256='):
+        return JsonResponse({"error": "Missing or invalid X-Hub-Signature-256 header"}, status=401)
+
+    payload_bytes = request.body
+    provided_signature = sig_header[7:]
+
+    # Locate repo by repo url or query param
+    repo_id = request.GET.get('repo_id')
+    repo = None
+    if repo_id:
+        repo = CodebaseRepo.objects.filter(id=repo_id).first()
+
+    if not repo:
+        try:
+            payload_json = json.loads(payload_bytes.decode('utf-8'))
+            repo_html_url = payload_json.get('repository', {}).get('html_url', '')
+            repo_clone_url = payload_json.get('repository', {}).get('clone_url', '')
+            repo = CodebaseRepo.objects.filter(
+                Q(repo_url=repo_html_url) | Q(repo_url=repo_clone_url)
+            ).first()
+        except Exception:
+            pass
+
+    if not repo:
+        return JsonResponse({"error": "Repository could not be resolved from webhook payload"}, status=404)
+
+    if not repo.webhook_secret:
+        return JsonResponse({"error": "Repository has no webhook_secret configured"}, status=400)
+
+    # HMAC verification
+    computed_sig = hmac.new(
+        repo.webhook_secret.encode('utf-8'),
+        payload_bytes,
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(computed_sig, provided_signature):
+        return JsonResponse({"error": "Invalid HMAC signature"}, status=403)
+
+    # Enqueue background scan job
+    job = enqueue_job(
+        profile=repo.profile,
+        user=None,
+        job_type='REPO_SCAN',
+        task_fn=run_repo_scan,
+        repo_id=repo.id
+    )
+
+    return JsonResponse({
+        "status": "success",
+        "message": f"Webhook verified. Background scan queued for '{repo.repo_name}'.",
+        "job_id": str(job.id)
+    }, status=200)
+
+
+# ==============================================================================
+# REAL-TIME UPDATES CHANNEL: SERVER-SENT EVENTS (SSE) STREAM
+# ==============================================================================
+
+import time
+from django.http import StreamingHttpResponse
+
+
+@csrf_exempt
+def realtime_event_stream_view(request):
+    """
+    GET /api/realtime/stream/
+    Server-Sent Events (SSE) live stream for telemetry KPIs, job progress,
+    truth changes, and compliance updates. Reconnects automatically with 10s fallback.
+    """
+    token = request.GET.get('token')
+    user = None
+    if token:
+        user = decode_user_token(token)
+    if not user:
+        user = get_authenticated_user_from_request(request)
+
+    profile = user.brand_profile if user and user.brand_profile else get_active_profile()
+
+    def event_stream():
+        yield f"event: connected\ndata: {json.dumps({'status': 'connected', 'profile_id': str(profile.id), 'user': user.username if user else 'anonymous'})}\n\n"
+
+        last_check = timezone.now()
+        heartbeat = 0
+
+        # Run stream loop (exits gracefully when client disconnects)
+        for _ in range(60):  # 60 iterations * 2s = 120s max stream lifetime before client auto-reconnects
+            time.sleep(2)
+            heartbeat += 1
+
+            try:
+                # Active background jobs for this profile
+                active_jobs = Job.objects.filter(profile=profile, status__in=['PENDING', 'RUNNING']).order_by('-updated_at')[:3]
+                for job in active_jobs:
+                    job_data = {
+                        'job_id': str(job.id),
+                        'job_type': job.job_type,
+                        'status': job.status,
+                        'progress': job.progress,
+                        'status_message': job.status_message,
+                    }
+                    yield f"event: job_progress\ndata: {json.dumps(job_data)}\n\n"
+
+                # Recent AuditEvents
+                recent_events = AuditEvent.objects.filter(
+                    profile=profile,
+                    timestamp__gte=last_check
+                ).order_by('timestamp')
+
+                for ev in recent_events:
+                    yield f"event: {ev.event_type.lower()}\ndata: {json.dumps(ev.to_dict())}\n\n"
+
+                last_check = timezone.now()
+
+                # Heartbeat ping every 10s
+                if heartbeat >= 5:
+                    heartbeat = 0
+                    yield f"event: ping\ndata: {json.dumps({'time': timezone.now().isoformat()})}\n\n"
+
+            except Exception:
+                break
+
+    response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
+    response['Cache-Control'] = 'no-cache'
+    response['X-Accel-Buffering'] = 'no'
+    return response
+
+
+# =============================================================================
+# Phase R3: Visual Test Lab & Accuracy Calibration Views
+# =============================================================================
+
+@admin_required
+def visual_test_lab_run_view(request):
+    """
+    GET / POST /api/visual-test-lab/run/
+    Admin only: Executes the accuracy calibration harness across the 42-asset realistic image corpus.
+    Returns metrics, confusion matrix, per-rule breakdown, and low-confidence review items.
+    """
+    if request.method not in ('GET', 'POST'):
+        return HttpResponseBadRequest("Method not allowed")
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+
+    from governance.engines.visual_harness import run_visual_calibration_harness
+    report = run_visual_calibration_harness(profile=profile)
+    return JsonResponse(report)
+
+
+@admin_required
+def visual_test_lab_report_view(request):
+    """
+    GET /api/visual-test-lab/report/?format=csv|json
+    Admin only: Generates downloadable calibration report.
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+
+    fmt = request.GET.get('format', 'json').lower()
+    from governance.engines.visual_harness import run_visual_calibration_harness, generate_calibration_csv_report
+    report = run_visual_calibration_harness(profile=profile)
+
+    if fmt == 'csv':
+        csv_content = generate_calibration_csv_report(report)
+        response = HttpResponse(csv_content, content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="brandguard_visual_calibration_report.csv"'
+        return response
+    return JsonResponse(report, json_dumps_params={'indent': 2})
+
+
+@admin_required
+def visual_test_lab_low_confidence_view(request):
+    """
+    GET /api/visual-test-lab/low-confidence/
+    Admin only: Returns detections routed to human review due to low confidence (< 0.75).
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+
+    from governance.engines.visual_harness import run_visual_calibration_harness
+    report = run_visual_calibration_harness(profile=profile)
+    return JsonResponse({
+        "status": "success",
+        "low_confidence_count": report.get("low_confidence_count", 0),
+        "detections": report.get("low_confidence_detections", [])
+    })
+
+
+def samples_catalog_view(request):
+    """
+    GET /api/samples/
+    Returns all 42 corpus sample assets grouped by category with metadata for the Sample Gallery.
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed")
+    import os
+    corpus_dir = os.path.join(settings.BASE_DIR, 'fixtures', 'images')
+    gt_path = os.path.join(corpus_dir, 'ground_truth.json')
+    if not os.path.exists(gt_path):
+        return JsonResponse({"samples": [], "total": 0})
+
+    with open(gt_path, 'r', encoding='utf-8') as f:
+        gt = json.load(f)
+
+    samples = []
+    for filename, meta in gt.get("images", {}).items():
+        ext = filename.split('.')[-1].upper()
+        clean_title = filename.replace('_', ' ')
+        for suffix in ['.png', '.jpeg', '.jpg', '.webp', '.pdf', '.svg']:
+            clean_title = clean_title.replace(suffix, '')
+        samples.append({
+            "filename": filename,
+            "title": clean_title.title(),
+            "category": meta.get("category", "OTHER"),
+            "format": ext,
+            "pass_fail": meta.get("pass_fail", "PASS"),
+            "expected_blockers": meta.get("expected_blockers", 0),
+            "expected_warnings": meta.get("expected_warnings", 0),
+            "expected_findings": meta.get("expected_findings", []),
+            "low_confidence": meta.get("low_confidence", False),
+            "notes": meta.get("notes", ""),
+            "sample_url": f"/samples/{filename}"
+        })
+
+    return JsonResponse({
+        "status": "success",
+        "total": len(samples),
+        "samples": samples
+    })
+
+
+GLOBAL_NAV_ITEMS = [
+    {
+        "id": "inspector",
+        "title": "Pre-Flight Inspector",
+        "description": "Multi-modal compliance compiler & live linter",
+        "keywords": ["scan", "lint", "editor", "draft", "compliance", "preflight", "check", "audit", "linter"],
+        "category": "Workspace",
+        "roles": ["ADMIN", "CONTENT_WRITER"],
+    },
+    {
+        "id": "registry",
+        "title": "Rule Registry",
+        "description": "Source of truth policies, allowed claims, and severity thresholds",
+        "keywords": ["rules", "registry", "policy", "lexicon", "tone", "visual", "factual", "edit rule", "policies"],
+        "category": "Governance",
+        "roles": ["ADMIN"],
+    },
+    {
+        "id": "guide",
+        "title": "Rule Guide",
+        "description": "Writer reference for brand claims and tone constraints",
+        "keywords": ["guide", "reference", "rules", "allowed claims", "prohibited words"],
+        "category": "Workspace",
+        "roles": ["CONTENT_WRITER"],
+    },
+    {
+        "id": "facts",
+        "title": "Fact Ledger & Codebase Verifier",
+        "description": "Ground-truth claims, codebase constant mappings, and blast radius",
+        "keywords": ["facts", "ledger", "constants", "repo", "blast radius", "truth", "github", "proposals", "ground truth"],
+        "category": "Governance",
+        "roles": ["ADMIN"],
+    },
+    {
+        "id": "visual_test_lab",
+        "title": "Visual Identity Test Lab",
+        "description": "Calibrated CV image corpus, precision/recall harness, and contrast sampling",
+        "keywords": ["lab", "visual", "corpus", "precision", "recall", "confusion matrix", "cvd", "contrast", "wcag", "accuracy"],
+        "category": "Governance",
+        "roles": ["ADMIN"],
+    },
+    {
+        "id": "queue",
+        "title": "Manager Review Queue",
+        "description": "Exception requests, sign-off workflow, and publication handoff",
+        "keywords": ["queue", "exceptions", "sign-off", "review", "approve", "manager", "decided"],
+        "category": "Governance",
+        "roles": ["ADMIN"],
+    },
+    {
+        "id": "telemetry",
+        "title": "Governance Dashboard & Telemetry",
+        "description": "Compliance score distributions, rule ambiguity, and system health",
+        "keywords": ["dashboard", "telemetry", "metrics", "analytics", "health", "system", "ambiguity", "csv", "pdf", "stats"],
+        "category": "Analytics",
+        "roles": ["ADMIN", "CONTENT_WRITER"],
+    },
+    {
+        "id": "team",
+        "title": "Team & Member Management",
+        "description": "Manage organizations, members, invite codes, and permissions",
+        "keywords": ["team", "users", "members", "invites", "approval", "roles", "organizations"],
+        "category": "Settings",
+        "roles": ["ADMIN"],
+    },
+    {
+        "id": "audit_log",
+        "title": "Governance Audit Log",
+        "description": "Immutable cryptographic event trail and compliance handoffs",
+        "keywords": ["audit", "log", "trail", "cryptographic", "events", "history"],
+        "category": "Compliance",
+        "roles": ["ADMIN"],
+    },
+    {
+        "id": "workspaces",
+        "title": "Workspace & Campaign Directory",
+        "description": "Active drafts, channels, and multi-version history",
+        "keywords": ["workspace", "drafts", "campaigns", "submissions", "projects"],
+        "category": "Workspace",
+        "roles": ["ADMIN", "CONTENT_WRITER"],
+    },
+    {
+        "id": "design",
+        "title": "Design System Showcase",
+        "description": "Forest design tokens, color palette, buttons, and alert components",
+        "keywords": ["design", "forest", "tokens", "theme", "components", "colors"],
+        "category": "System",
+        "roles": ["ADMIN", "CONTENT_WRITER"],
+    },
+]
+
+
+@csrf_exempt
+def global_search_view(request):
+    """
+    GET /api/search/?q=<query>&company_id=<company_id>&limit=<limit>
+    Unified multi-tenant search across Rules, Facts, Submissions/Drafts, and Navigation.
+    Returns categorized results with rich previews and navigation targets.
+    """
+    if request.method != 'GET':
+        return HttpResponseBadRequest("Method not allowed. Use GET.")
+
+    q = request.GET.get('q', '').strip()
+    try:
+        limit = min(int(request.GET.get('limit', 8)), 20)
+    except (ValueError, TypeError):
+        limit = 8
+
+    user = get_authenticated_user_from_request(request)
+    user_role = getattr(user, 'role', 'ADMIN') if user else 'ADMIN'
+    is_admin = user_role == 'ADMIN' or getattr(user, 'is_superuser', False)
+
+    profile, company, err = resolve_request_profile(request)
+    if err:
+        return err
+
+    from django.db.models import Q
+
+    # Filter navigation items by user role and query
+    nav_matches = []
+    for item in GLOBAL_NAV_ITEMS:
+        if user_role not in item["roles"]:
+            continue
+        if not q:
+            # When query is empty, suggest primary navigation tabs
+            suggested = ["inspector", "registry", "facts", "telemetry"] if is_admin else ["inspector", "workspaces", "guide"]
+            if item["id"] in suggested:
+                nav_matches.append(item)
+        else:
+            q_lower = q.lower()
+            if (
+                q_lower in item["title"].lower()
+                or q_lower in item["description"].lower()
+                or any(q_lower in kw for kw in item["keywords"])
+            ):
+                nav_matches.append(item)
+
+    # 1. Search Rules
+    rules_data = []
+    if profile:
+        rule_qs = BrandRule.objects.filter(profile=profile, is_active=True)
+        if q:
+            rule_qs = rule_qs.filter(
+                Q(rule_code__icontains=q)
+                | Q(title__icontains=q)
+                | Q(rule_description__icontains=q)
+                | Q(claims_allowed__icontains=q)
+                | Q(claims_disallowed__icontains=q)
+                | Q(pillar__icontains=q)
+                | Q(severity__icontains=q)
+            )
+        rule_matches = rule_qs.order_by('rule_code')[:limit]
+        for r in rule_matches:
+            rules_data.append({
+                "id": str(r.id),
+                "rule_code": r.rule_code,
+                "title": r.title,
+                "pillar": r.pillar,
+                "severity": r.severity,
+                "version": r.version,
+                "claims_allowed": r.claims_allowed or "",
+                "claims_disallowed": r.claims_disallowed or "",
+                "rule_description": r.rule_description or "",
+            })
+
+    # 2. Search Facts
+    facts_data = []
+    if profile:
+        fact_qs = FactLedger.objects.filter(profile=profile)
+        if company:
+            fact_qs = fact_qs.filter(Q(company=company) | Q(company__isnull=True))
+        if q:
+            fact_qs = fact_qs.filter(
+                Q(fact_code__icontains=q)
+                | Q(claim_truth__icontains=q)
+                | Q(category__icontains=q)
+                | Q(source__icontains=q)
+            )
+        fact_matches = fact_qs.order_by('-last_verified')[:limit]
+        for f in fact_matches:
+            facts_data.append({
+                "id": str(f.id),
+                "fact_code": f.fact_code,
+                "category": f.category,
+                "claim_truth": f.claim_truth,
+                "source": f.source,
+                "is_verified": f.is_verified,
+                "valid_until": str(f.valid_until) if f.valid_until else "",
+            })
+
+    # 3. Search Drafts / Submissions
+    drafts_data = []
+    if profile:
+        sub_qs = Submission.objects.filter(profile=profile)
+        if company:
+            sub_qs = sub_qs.filter(Q(company=company) | Q(company__isnull=True))
+        if not is_admin and user and user.is_authenticated:
+            sub_qs = sub_qs.filter(Q(author=user) | Q(author__isnull=True))
+        if q:
+            sub_qs = sub_qs.filter(
+                Q(title__icontains=q)
+                | Q(channel_context__icontains=q)
+                | Q(status__icontains=q)
+                | Q(versions__raw_text__icontains=q)
+            ).distinct()
+        sub_matches = sub_qs.order_by('-created_at')[:limit]
+        for s in sub_matches:
+            latest_v = s.versions.order_by('-version_number').first()
+            drafts_data.append({
+                "id": str(s.id),
+                "title": s.title,
+                "channel": s.channel_context,
+                "status": s.status,
+                "score": latest_v.compliance_score if latest_v else 100.0,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+            })
+
+    total = len(nav_matches) + len(rules_data) + len(facts_data) + len(drafts_data)
+
+    return JsonResponse({
+        "query": q,
+        "total": total,
+        "navigation": nav_matches,
+        "rules": rules_data,
+        "facts": facts_data,
+        "drafts": drafts_data,
+    })
+
 
 

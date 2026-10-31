@@ -59,7 +59,8 @@ class Phase3WorkspaceInspectorTestCase(TestCase):
             username="admin_p3",
             email="admin3@novapay.io",
             password="adminpassword123",
-            role="ADMIN"
+            role="ADMIN",
+            brand_profile=self.profile
         )
         self.admin_token = generate_user_token(self.admin)
 
@@ -68,7 +69,8 @@ class Phase3WorkspaceInspectorTestCase(TestCase):
             username="writer_p3",
             email="writer3@novapay.io",
             password="writerpassword123",
-            role="CONTENT_WRITER"
+            role="CONTENT_WRITER",
+            brand_profile=self.profile
         )
         self.writer_token = generate_user_token(self.writer)
 

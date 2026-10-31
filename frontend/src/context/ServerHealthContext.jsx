@@ -10,13 +10,15 @@ export function ServerHealthProvider({ children }) {
   const [wakingElapsed, setWakingElapsed] = useState(0);
   const [lastChecked, setLastChecked] = useState(null);
   const [serverData, setServerData] = useState(null);
+  const [readinessData, setReadinessData] = useState(null);
+  const [checkingReadiness, setCheckingReadiness] = useState(false);
   const [isWakingBannerDismissed, setIsWakingBannerDismissed] = useState(false);
 
   const wakingTimerRef = useRef(null);
   const pollIntervalRef = useRef(null);
   const keepAliveIntervalRef = useRef(null);
 
-  // Ping the server endpoint
+  // Ping the server endpoint (/healthz or fallback to /api/health/)
   const checkHealth = useCallback(async (isInitial = false) => {
     const startTime = performance.now();
     const controller = new AbortController();
@@ -24,7 +26,7 @@ export function ServerHealthProvider({ children }) {
     const timeoutId = setTimeout(() => controller.abort(), 3500);
 
     try {
-      const res = await fetch(`${API_BASE}/api/health/`, {
+      const res = await fetch(`${API_BASE}/healthz`, {
         signal: controller.signal,
         cache: 'no-store'
       });
@@ -47,6 +49,27 @@ export function ServerHealthProvider({ children }) {
       // If request timed out (Render free tier cold start) or failed connection
       setStatus('waking');
       return false;
+    }
+  }, []);
+
+  // Deep readiness probe (/readyz)
+  const checkReadiness = useCallback(async () => {
+    setCheckingReadiness(true);
+    try {
+      const res = await fetch(`${API_BASE}/readyz`, { cache: 'no-store' });
+      const data = await res.json();
+      setReadinessData(data);
+      return data;
+    } catch (err) {
+      const fallbackErr = {
+        status: 'not_ready',
+        error: err.message,
+        timestamp: new Date().toISOString()
+      };
+      setReadinessData(fallbackErr);
+      return fallbackErr;
+    } finally {
+      setCheckingReadiness(false);
     }
   }, []);
 
@@ -89,29 +112,12 @@ export function ServerHealthProvider({ children }) {
     };
   }, [status, checkHealth]);
 
-  // Keep-Alive Heartbeat: Pings every 8 minutes while tab is open to prevent Render 15-minute hibernation
+  // Server Health Check: Initial check on mount (background keep-alive heartbeat disabled to ensure Render server stays off/hibernated when idle)
   useEffect(() => {
-    // Initial check on mount
     checkHealth(true);
-
-    // Keep-alive every 8 minutes (480,000ms)
-    keepAliveIntervalRef.current = setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        checkHealth();
-      }
-    }, 480000);
-
-    // Handle tab visibility change
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        checkHealth();
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       if (keepAliveIntervalRef.current) clearInterval(keepAliveIntervalRef.current);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [checkHealth]);
 
@@ -130,9 +136,12 @@ export function ServerHealthProvider({ children }) {
         wakingElapsed,
         lastChecked,
         serverData,
+        readinessData,
+        checkingReadiness,
         isWakingBannerDismissed,
         setIsWakingBannerDismissed,
         checkHealth,
+        checkReadiness,
         wakeServer
       }}
     >

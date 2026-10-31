@@ -19,6 +19,13 @@ export default function TeamManagementView({ apiBase = API_BASE }) {
 
   // Invite/Add User Modal state
   const [inviteModalOpen, setInviteModalOpen] = useState(false);
+  const [pendingMembers, setPendingMembers] = useState([]);
+  const [inviteLinkModalOpen, setInviteLinkModalOpen] = useState(false);
+  const [createdInviteUrl, setCreatedInviteUrl] = useState('');
+  const [creatingInvite, setCreatingInvite] = useState(false);
+  const [inviteUses, setInviteUses] = useState(1);
+  const [copiedLink, setCopiedLink] = useState(false);
+
   const [formData, setFormData] = useState({
     username: '',
     email: '',
@@ -34,6 +41,23 @@ export default function TeamManagementView({ apiBase = API_BASE }) {
   // Webhook Test State
   const [testingWebhook, setTestingWebhook] = useState(false);
   const [webhookStatus, setWebhookStatus] = useState(null);
+
+  const fetchPendingMembers = async () => {
+    try {
+      const res = await fetch(`${apiBase}/api/members/pending/`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPendingMembers(data.pending_members || []);
+      }
+    } catch (e) {
+      // Ignored
+    }
+  };
 
   const fetchTeam = async () => {
     setLoading(true);
@@ -60,7 +84,65 @@ export default function TeamManagementView({ apiBase = API_BASE }) {
 
   useEffect(() => {
     fetchTeam();
+    fetchPendingMembers();
   }, [token]);
+
+  const handleApproveMember = async (userId) => {
+    try {
+      const res = await fetch(`${apiBase}/api/members/${userId}/approve/`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      if (res.ok) {
+        fetchPendingMembers();
+        fetchTeam();
+      }
+    } catch (err) {}
+  };
+
+  const handleRejectMember = async (userId) => {
+    try {
+      const res = await fetch(`${apiBase}/api/members/${userId}/reject/`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      if (res.ok) {
+        fetchPendingMembers();
+        fetchTeam();
+      }
+    } catch (err) {}
+  };
+
+  const handleGenerateInviteLink = async () => {
+    setCreatingInvite(true);
+    try {
+      const res = await fetch(`${apiBase}/api/invites/`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          max_uses: inviteUses,
+          expires_in_days: 7,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const fullUrl = `${window.location.origin}${data.invite_url}`;
+        setCreatedInviteUrl(fullUrl);
+      }
+    } catch (err) {}
+    finally {
+      setCreatingInvite(false);
+    }
+  };
 
   const handleCreateUser = async (e) => {
     e.preventDefault();
@@ -168,14 +250,75 @@ export default function TeamManagementView({ apiBase = API_BASE }) {
 
           <button
             type="button"
+            onClick={() => {
+              setCreatedInviteUrl('');
+              setInviteLinkModalOpen(true);
+            }}
+            className="flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] hover:bg-[var(--surface)] text-[var(--primary)] transition cursor-pointer shadow-2xs"
+          >
+            <Mail className="w-4 h-4 text-[var(--primary)]" />
+            <span>Generate 7-Day Invite Link</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setInviteModalOpen(true)}
-            className="flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-[#0A3423] hover:bg-[#134e34] dark:bg-emerald-600 dark:hover:bg-emerald-500 text-white shadow-sm transition cursor-pointer"
+            className="flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-white shadow-sm transition cursor-pointer"
           >
             <UserPlus className="w-4 h-4" />
-            {t('btn_invite_member', 'Invite Team Member')}
+            {t('btn_invite_member', 'Provision User')}
           </button>
         </div>
       </div>
+
+      {/* Pending Writer Approvals (Requirement G) */}
+      {pendingMembers.length > 0 && (
+        <div className="mt-6 p-4 rounded-[var(--radius-card)] bg-[var(--warning-tint)] border border-[var(--warning-text)]/30 text-[var(--text)]">
+          <div className="flex items-center justify-between pb-3 border-b border-[var(--warning-text)]/20">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-[var(--warning-text)] animate-ping" />
+              <h3 className="font-bold text-sm font-serif text-[var(--warning-text)]">
+                Pending Writer Approvals ({pendingMembers.length})
+              </h3>
+            </div>
+            <span className="text-xs font-mono text-[var(--text-muted)]">
+              Approval required before workspace login
+            </span>
+          </div>
+
+          <div className="divide-y divide-[var(--warning-text)]/10 mt-2">
+            {pendingMembers.map((member) => (
+              <div key={member.id} className="py-2.5 flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  <div className="text-xs font-bold text-[var(--text)]">
+                    {member.name} ({member.email})
+                  </div>
+                  <div className="text-[11px] font-mono text-[var(--text-muted)]">
+                    Joined: {new Date(member.date_joined).toLocaleDateString()} · Role: {member.role}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleApproveMember(member.id)}
+                    className="px-3 py-1 rounded text-xs font-bold bg-[var(--cleared)] hover:opacity-90 text-white shadow-2xs transition cursor-pointer"
+                  >
+                    Approve Access
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleRejectMember(member.id)}
+                    className="px-3 py-1 rounded text-xs font-bold bg-[var(--blocker)] hover:opacity-90 text-white shadow-2xs transition cursor-pointer"
+                  >
+                    Decline
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Aggregate Team Performance Metrics */}
       {teamMetrics && (
@@ -590,12 +733,123 @@ export default function TeamManagementView({ apiBase = API_BASE }) {
                 <button
                   type="submit"
                   disabled={submittingUser}
-                  className="px-4 py-2 text-xs font-semibold rounded-lg bg-[#0A3423] hover:bg-[#134e34] dark:bg-emerald-600 dark:hover:bg-emerald-500 text-white transition cursor-pointer shadow-sm"
+                  className="px-4 py-2 text-xs font-semibold rounded-lg bg-[var(--primary)] hover:bg-[var(--primary-hover)] text-white transition cursor-pointer shadow-sm"
                 >
                   {submittingUser ? 'Provisioning...' : 'Provision Member'}
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* 7-Day Invite Generator Modal */}
+      {inviteLinkModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="bg-[var(--surface)] border border-[var(--border)] rounded-xl shadow-xl max-w-md w-full p-6 space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-[var(--border)]">
+              <div className="flex items-center gap-2">
+                <div className="p-2 rounded-lg bg-[var(--surface-alt)] text-[var(--primary)]">
+                  <Mail className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-[var(--text)] font-serif">
+                    Generate 7-Day Writer Invite
+                  </h3>
+                  <p className="text-[11px] text-[var(--text-muted)]">
+                    Cryptographically signed, single or limited-use registration link.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setInviteLinkModalOpen(false)}
+                className="text-[var(--text-muted)] hover:text-[var(--text)] p-1 rounded-md"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {!createdInviteUrl ? (
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-[var(--text)] mb-1">
+                    Maximum Allowed Uses
+                  </label>
+                  <select
+                    value={inviteUses}
+                    onChange={(e) => setInviteUses(parseInt(e.target.value))}
+                    className="w-full px-3 py-2 text-xs rounded-lg border border-[var(--border)] bg-[var(--surface-alt)] text-[var(--text)]"
+                  >
+                    <option value={1}>Single-use only (Recommended for individual hires)</option>
+                    <option value={5}>Up to 5 writers</option>
+                    <option value={10}>Up to 10 writers</option>
+                    <option value={25}>Up to 25 writers</option>
+                  </select>
+                  <p className="text-[11px] text-[var(--text-muted)] mt-1 font-mono">
+                    Validity: Automatically expires in exactly 7 days.
+                  </p>
+                </div>
+
+                <div className="flex justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setInviteLinkModalOpen(false)}
+                    className="px-3.5 py-2 text-xs rounded-lg border border-[var(--border)] text-[var(--text-muted)]"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={creatingInvite}
+                    onClick={handleGenerateInviteLink}
+                    className="px-4 py-2 text-xs font-bold rounded-lg bg-[var(--primary)] text-white hover:bg-[var(--primary-hover)] transition cursor-pointer shadow-2xs"
+                  >
+                    {creatingInvite ? 'Generating...' : 'Create Invite Link'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="p-3 rounded-lg bg-[var(--cleared-tint)] border border-[var(--cleared)]/30 text-xs text-[var(--cleared)] font-medium">
+                  ✓ Invite link generated! Valid for 7 days.
+                </div>
+                <div>
+                  <label className="block text-[11px] font-mono text-[var(--text-muted)] mb-1">
+                    Writer Registration URL
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      readOnly
+                      value={createdInviteUrl}
+                      className="w-full px-3 py-2 text-xs font-mono bg-[var(--surface-alt)] border border-[var(--border)] rounded-lg text-[var(--text)]"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText(createdInviteUrl);
+                        setCopiedLink(true);
+                        setTimeout(() => setCopiedLink(false), 2500);
+                      }}
+                      className="px-3 py-2 rounded-lg bg-[var(--primary)] text-white text-xs font-bold shrink-0 hover:bg-[var(--primary-hover)] cursor-pointer"
+                    >
+                      {copiedLink ? 'Copied!' : 'Copy'}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex justify-end pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setInviteLinkModalOpen(false)}
+                    className="px-4 py-1.5 rounded-lg border border-[var(--border)] text-xs text-[var(--text)] font-semibold"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

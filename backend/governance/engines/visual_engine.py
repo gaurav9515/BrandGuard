@@ -10,7 +10,7 @@ import io
 import math
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageOps, ImageCms
 from sklearn.cluster import KMeans
 try:
     import pymupdf as fitz
@@ -19,6 +19,34 @@ except ImportError:
         import fitz
     except ImportError:
         fitz = None
+
+
+def normalize_pil_image(pil_img):
+    """
+    Normalizes an input PIL image:
+    1. EXIF orientation transpose (auto-rotates tags 3, 6, 8, etc.).
+    2. Color Profile / ICC / CMYK normalization: converts Display P3, CMYK, or Adobe RGB to standard sRGB.
+    3. Normalizes image mode to standard RGB.
+    """
+    try:
+        pil_img = ImageOps.exif_transpose(pil_img)
+    except Exception:
+        pass
+
+    try:
+        icc = pil_img.info.get('icc_profile')
+        if icc:
+            f_in = io.BytesIO(icc)
+            src_profile = ImageCms.ImageCmsProfile(f_in)
+            srgb_profile = ImageCms.createProfile('sRGB')
+            pil_img = ImageCms.profileToProfile(pil_img, src_profile, srgb_profile, outputMode='RGB')
+            return pil_img
+    except Exception:
+        pass
+
+    if pil_img.mode != 'RGB':
+        pil_img = pil_img.convert('RGB')
+    return pil_img
 
 
 CVD_MATRICES = {
@@ -217,6 +245,8 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
         kmeans = KMeans(n_clusters=4, n_init=5, random_state=42)
         kmeans.fit(pixels)
         centers = kmeans.cluster_centers_
+        counts = np.bincount(kmeans.labels_, minlength=len(centers))
+        fractions = counts / len(pixels)
 
         approved_labs = []
         for swatch in allowed_palette:
@@ -225,10 +255,14 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
             approved_labs.append((swatch, sw_lab))
 
         flagged_colors = set()
-        for cluster_rgb in centers:
+        for idx, cluster_rgb in enumerate(centers):
+            # Ignore thin anti-aliased edge transitions and noise (< 2.5% of image area)
+            if fractions[idx] < 0.025:
+                continue
+
             mean_intensity = np.mean(cluster_rgb)
-            # Ignore pure white (> 245) or black (< 12) background clusters
-            if mean_intensity > 245 or mean_intensity < 12:
+            # Ignore pure white / light canvas (> 242) or dark canvas / near-black (< 26)
+            if mean_intensity > 242 or mean_intensity < 26:
                 continue
 
             c_lab = rgb_to_lab(cluster_rgb)
@@ -250,7 +284,7 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
                 nearest_swatch = {"name": "Approved", "hex": "#0F172A"}
                 allowed_tol = sys_threshold
 
-            effective_threshold = max(sys_threshold, allowed_tol)
+            effective_threshold = allowed_tol
             if min_de > effective_threshold:
                 cluster_hex = rgb_to_hex(cluster_rgb)
                 if cluster_hex in flagged_colors:
@@ -259,6 +293,9 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
 
                 bbox = find_color_bounding_box(img_rgb, cluster_rgb)
                 bx, by, bw, bh = bbox
+                # Require a coherent graphic region (reject scattered anti-aliasing edge transitions)
+                if bw < 20 or bh < 20 or (bw * bh) < 400:
+                    continue
 
                 # Suggest top approved swatches
                 suggested_hexes = [
@@ -268,11 +305,19 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
                 if not suggested_hexes:
                     suggested_hexes = [f"Replace {cluster_hex} with {nearest_swatch.get('hex')}"]
 
-                findings.append({
+                # Determine confidence and review lane
+                confidence = 1.0
+                is_low_conf = False
+                if min_de <= (effective_threshold + 0.35):
+                    confidence = 0.68
+                    is_low_conf = True
+
+                status = "IN_REVIEW" if is_low_conf else "OPEN"
+                finding_item = {
                     "pillar": "VISUAL",
                     "severity": "BLOCKER",
                     "engine_provenance": "DETERMINISTIC_CV",
-                    "confidence": 1.0,
+                    "confidence": confidence,
                     "rule_citation_code": "VIS_COLOR_001",
                     "rule_citation_title": "Off-Brand Color Palette Violation",
                     "source_excerpt": f"Detected unapproved color {cluster_hex} (CIELAB ΔE={round(min_de, 2)} against approved {nearest_swatch.get('name', 'swatch')} {nearest_swatch.get('hex')})",
@@ -294,11 +339,15 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
                         f"Nearest approved color is {nearest_swatch.get('name')} ({nearest_swatch.get('hex')})."
                     ),
                     "suggested_fixes": suggested_hexes,
-                    "status": "OPEN",
-                })
+                    "status": status,
+                }
+                if is_low_conf:
+                    finding_item["flagged_for_human_review"] = True
+                    finding_item["review_reason"] = "LOW_CONFIDENCE_DETECTION"
+                findings.append(finding_item)
 
         # Color-Vision Deficiency (CVD) Ambiguity Linter
-        valid_clusters = [c for c in centers if 12 <= np.mean(c) <= 245]
+        valid_clusters = [centers[k] for k in range(len(centers)) if fractions[k] >= 0.025 and 26 <= np.mean(centers[k]) <= 242]
         cvd_flagged = False
         for i in range(len(valid_clusters)):
             for j in range(i + 1, len(valid_clusters)):
@@ -307,45 +356,52 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
                 lab1 = rgb_to_lab(c1)
                 lab2 = rgb_to_lab(c2)
                 de_normal = calculate_delta_e(lab1, lab2)
+                lum_cr = calculate_contrast_ratio(c1, c2)
 
-                if de_normal > 25.0:
-                    deut1 = simulate_color_blindness(np.array([c1]), "deuteranopia")[0]
-                    deut2 = simulate_color_blindness(np.array([c2]), "deuteranopia")[0]
-                    lab_d1 = rgb_to_lab(deut1)
-                    lab_d2 = rgb_to_lab(deut2)
-                    de_deut = calculate_delta_e(lab_d1, lab_d2)
+                # Only evaluate if normal vision has clear difference but low luminance distinction
+                if de_normal > 20.0 and lum_cr < 2.5:
+                    for cvd_mode in ["deuteranopia", "protanopia", "tritanopia"]:
+                        sim1 = simulate_color_blindness(np.array([c1]), cvd_mode)[0]
+                        sim2 = simulate_color_blindness(np.array([c2]), cvd_mode)[0]
+                        lab_s1 = rgb_to_lab(sim1)
+                        lab_s2 = rgb_to_lab(sim2)
+                        de_sim = calculate_delta_e(lab_s1, lab_s2)
+                        ratio = de_sim / max(de_normal, 1e-5)
 
-                    if (de_deut < 8.0 or de_deut < 28.0 or (de_deut / de_normal < 0.45)) and not cvd_flagged:
-                        cvd_flagged = True
-                        bbox1 = find_color_bounding_box(img_rgb, c1)
-                        findings.append({
-                            "pillar": "VISUAL",
-                            "severity": "WARNING",
-                            "engine_provenance": "DETERMINISTIC_CV",
-                            "confidence": 1.0,
-                            "rule_citation_code": "VIS_A11Y_CVD",
-                            "rule_citation_title": "Color-Vision Deficiency Ambiguity: Key visual elements lose distinction under Deuteranopia",
-                            "source_excerpt": f"Distinct colors {rgb_to_hex(c1)} and {rgb_to_hex(c2)} (ΔE={round(de_normal, 1)}) collapse to indistinguishable ΔE={round(de_deut, 1)} under red-green color blindness",
-                            "location_json": {
-                                "format": "BOUNDING_BOX",
-                                "x": bbox1[0], "y": bbox1[1], "w": bbox1[2], "h": bbox1[3],
-                                "img_width": orig_w, "img_height": orig_h,
-                                "x_pct": round((bbox1[0] / orig_w) * 100, 2),
-                                "y_pct": round((bbox1[1] / orig_h) * 100, 2),
-                                "w_pct": round((bbox1[2] / orig_w) * 100, 2),
-                                "h_pct": round((bbox1[3] / orig_h) * 100, 2),
-                            },
-                            "explanation": (
-                                f"Key visual color clusters {rgb_to_hex(c1)} and {rgb_to_hex(c2)} have strong normal contrast (ΔE={round(de_normal, 1)}), "
-                                f"but collapse into ambiguous shades under Deuteranopia (ΔE={round(de_deut, 1)} < 8.0). "
-                                "Users with red-green CVD will struggle to perceive visual hierarchy or CTAs."
-                            ),
-                            "suggested_fixes": [
-                                "Introduce high-contrast luminance differentials between background and CTA elements",
-                                "Add secondary non-color visual cues (underlines, text labels, or distinct stroke borders)"
-                            ],
-                            "status": "OPEN",
-                        })
+                        # True collapse under CVD: low luminance (< 2.5) and significant color distinction loss
+                        if (ratio < 0.70 or de_sim < 28.0) and not cvd_flagged:
+                            cvd_flagged = True
+                            bbox1 = find_color_bounding_box(img_rgb, c1)
+                            findings.append({
+                                "pillar": "VISUAL",
+                                "severity": "WARNING",
+                                "engine_provenance": "DETERMINISTIC_CV",
+                                "confidence": 1.0,
+                                "rule_citation_code": "VIS_A11Y_CVD",
+                                "rule_citation_title": f"Color-Vision Deficiency Ambiguity: Key visual elements lose distinction under {cvd_mode.capitalize()}",
+                                "source_excerpt": f"Distinct colors {rgb_to_hex(c1)} and {rgb_to_hex(c2)} (ΔE={round(de_normal, 1)}) collapse to indistinguishable ΔE={round(de_sim, 1)} under {cvd_mode}",
+                                "location_json": {
+                                    "format": "BOUNDING_BOX",
+                                    "x": bbox1[0], "y": bbox1[1], "w": bbox1[2], "h": bbox1[3],
+                                    "img_width": orig_w, "img_height": orig_h,
+                                    "x_pct": round((bbox1[0] / orig_w) * 100, 2),
+                                    "y_pct": round((bbox1[1] / orig_h) * 100, 2),
+                                    "w_pct": round((bbox1[2] / orig_w) * 100, 2),
+                                    "h_pct": round((bbox1[3] / orig_h) * 100, 2),
+                                    "cvd_mode": cvd_mode,
+                                },
+                                "explanation": (
+                                    f"Key visual color clusters {rgb_to_hex(c1)} and {rgb_to_hex(c2)} have low luminance contrast ({round(lum_cr, 1)}:1) "
+                                    f"and collapse into ambiguous shades under {cvd_mode.capitalize()} (ΔE drops from {round(de_normal, 1)} to {round(de_sim, 1)}). "
+                                    f"Users with {cvd_mode} will struggle to perceive visual hierarchy or call-to-action distinction."
+                                ),
+                                "suggested_fixes": [
+                                    "Introduce high-contrast luminance differentials between background and CTA elements",
+                                    "Add secondary non-color visual cues (underlines, text labels, or distinct stroke borders)"
+                                ],
+                                "status": "OPEN",
+                            })
+                            break
     except Exception as e:
         # Non-fatal error fallback
         pass
@@ -356,11 +412,13 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
         # Morphological gradient to isolate text edge boundaries
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
 
-        # Otsu thresholding
-        _, thresh = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Otsu thresholding combined with low-gradient threshold for subtle contrast
+        _, thresh_otsu = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        thresh_low = (gradient > 8).astype(np.uint8) * 255
+        thresh = cv2.bitwise_or(thresh_otsu, thresh_low)
 
         # Morphological close to join adjacent text characters into lines/blocks
         kernel_conn = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
@@ -370,63 +428,97 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
 
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
-            # Filter for plausible text box dimensions
-            if w < 24 or h < 10 or (w > orig_w * 0.95 and h > orig_h * 0.95):
+            # Filter for plausible text box dimensions (reject full-image cards or outer borders)
+            if w < 24 or h < 10 or h > orig_h * 0.35 or (w > orig_w * 0.60 and h > orig_h * 0.25):
                 continue
-            if w / max(h, 1) < 1.0 and w < 40:
+            if w > orig_w * 0.95 and h > orig_h * 0.95:
+                continue
+            if w / max(h, 1) < 0.8 and w < 40:
                 continue
 
             roi_rgb = img_rgb[y:y+h, x:x+w]
             roi_gray = gray[y:y+h, x:x+w]
 
-            # Otsu bimodal thresholding inside contour ROI
-            _, roi_bin = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            fg_mask = (roi_bin == 0)
-            bg_mask = (roi_bin == 255)
+            p90 = np.percentile(roi_gray, 90)
+            p10 = np.percentile(roi_gray, 10)
+            if (p90 - p10) < 6:
+                continue
 
-            if np.sum(fg_mask) >= 8 and np.sum(bg_mask) >= 8:
-                fg_mean = np.mean(roi_rgb[fg_mask], axis=0)
-                bg_mean = np.mean(roi_rgb[bg_mask], axis=0)
-                cr = calculate_contrast_ratio(fg_mean, bg_mean)
+            c_high = np.mean(roi_rgb[roi_gray >= p90], axis=0)
+            c_low = np.mean(roi_rgb[roi_gray <= p10], axis=0)
+            avg_cr = calculate_contrast_ratio(c_high, c_low)
 
-                if 1.15 < cr < wcag_min_ratio:
-                    fg_hex = rgb_to_hex(fg_mean)
-                    bg_hex = rgb_to_hex(bg_mean)
-                    findings.append({
-                        "pillar": "VISUAL",
-                        "severity": "BLOCKER",
-                        "engine_provenance": "DETERMINISTIC_CV",
-                        "confidence": 1.0,
-                        "rule_citation_code": "VIS_WCAG_2.1",
-                        "rule_citation_title": "WCAG 2.1 Accessibility Contrast Failure",
-                        "source_excerpt": f"Text region contrast ratio {round(cr, 2)}:1 (Text {fg_hex} on Background {bg_hex})",
-                        "location_json": {
-                            "format": "BOUNDING_BOX",
-                            "x": int(x),
-                            "y": int(y),
-                            "w": int(w),
-                            "h": int(h),
-                            "img_width": orig_w,
-                            "img_height": orig_h,
-                            "x_pct": round((x / orig_w) * 100, 2),
-                            "y_pct": round((y / orig_h) * 100, 2),
-                            "w_pct": round((w / orig_w) * 100, 2),
-                            "h_pct": round((h / orig_h) * 100, 2),
-                        },
-                        "explanation": (
-                            f"Detected text contrast ratio of {round(cr, 2)}:1, which falls below the brand WCAG 2.1 AA minimum standard ({wcag_min_ratio}:1). "
-                            f"Text foreground is {fg_hex} over {bg_hex}."
-                        ),
-                        "suggested_fixes": [
-                            f"Shift text foreground to high-contrast '#0F172A' (Slate 900) or '#FFFFFF'",
-                            f"Use brand primary '#00C885' against deep background '#062B22' for 7.8:1 contrast",
-                        ],
-                        "status": "OPEN",
-                    })
-                    # Limit to top 2 contrast violations per asset to avoid spamming
-                    contrast_findings = [f for f in findings if f["rule_citation_code"] == "VIS_WCAG_2.1"]
-                    if len(contrast_findings) >= 2:
-                        break
+            # Spatial slice sampling along text line to detect local background gradient drops
+            min_slice_cr = avg_cr
+            num_slices = 4
+            slice_w = max(1, w // num_slices)
+            for s_i in range(num_slices):
+                sx1 = s_i * slice_w
+                sx2 = min(w, (s_i + 1) * slice_w)
+                if (sx2 - sx1) < 12:
+                    continue
+                s_roi_gray = roi_gray[:, sx1:sx2]
+                s_p90 = np.percentile(s_roi_gray, 90)
+                s_p10 = np.percentile(s_roi_gray, 10)
+                if (s_p90 - s_p10) >= 8:
+                    s_roi_rgb = roi_rgb[:, sx1:sx2]
+                    s_high = np.mean(s_roi_rgb[s_roi_gray >= s_p90], axis=0)
+                    s_low = np.mean(s_roi_rgb[s_roi_gray <= s_p10], axis=0)
+                    s_cr = calculate_contrast_ratio(s_high, s_low)
+                    if s_cr < min_slice_cr:
+                        min_slice_cr = s_cr
+
+            cr = min(avg_cr, min_slice_cr)
+
+            if 1.05 < cr < wcag_min_ratio:
+                confidence = 1.0
+                is_low_conf = False
+                if cr >= (wcag_min_ratio - 0.35):  # Near-threshold e.g. 4.15 - 4.50:1 -> Low confidence review lane
+                    confidence = 0.70
+                    is_low_conf = True
+
+                status = "IN_REVIEW" if is_low_conf else "OPEN"
+                fg_hex = rgb_to_hex(c_low if np.mean(c_low) < np.mean(c_high) else c_high)
+                bg_hex = rgb_to_hex(c_high if np.mean(c_low) < np.mean(c_high) else c_low)
+                finding_item = {
+                    "pillar": "VISUAL",
+                    "severity": "BLOCKER",
+                    "engine_provenance": "DETERMINISTIC_CV",
+                    "confidence": confidence,
+                    "rule_citation_code": "VIS_WCAG_2.1",
+                    "rule_citation_title": "WCAG 2.1 Accessibility Contrast Failure",
+                    "source_excerpt": f"Text region contrast ratio {round(cr, 2)}:1 (Text {fg_hex} on Background {bg_hex})",
+                    "location_json": {
+                        "format": "BOUNDING_BOX",
+                        "x": int(x),
+                        "y": int(y),
+                        "w": int(w),
+                        "h": int(h),
+                        "img_width": orig_w,
+                        "img_height": orig_h,
+                        "x_pct": round((x / orig_w) * 100, 2),
+                        "y_pct": round((y / orig_h) * 100, 2),
+                        "w_pct": round((w / orig_w) * 100, 2),
+                        "h_pct": round((h / orig_h) * 100, 2),
+                        "worst_case_edge_sampled": min_slice_cr < avg_cr,
+                    },
+                    "explanation": (
+                        f"Detected text contrast ratio of {round(cr, 2)}:1 (worst-case spatial slice sampled), which falls below the brand WCAG 2.1 AA minimum standard ({wcag_min_ratio}:1). "
+                        f"Text foreground is {fg_hex} over {bg_hex}."
+                    ),
+                    "suggested_fixes": [
+                        f"Shift text foreground to high-contrast '#0F172A' (Slate 900) or '#FFFFFF'",
+                        f"Use brand primary '#00C885' against deep background '#062B22' for 7.8:1 contrast",
+                    ],
+                    "status": status,
+                }
+                if is_low_conf:
+                    finding_item["flagged_for_human_review"] = True
+                    finding_item["review_reason"] = "LOW_CONFIDENCE_DETECTION"
+                findings.append(finding_item)
+                contrast_findings = [f for f in findings if f["rule_citation_code"] == "VIS_WCAG_2.1"]
+                if len(contrast_findings) >= 2:
+                    break
     except Exception as e:
         pass
 
@@ -463,7 +555,7 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
             edge_count = np.sum(edges[ring_mask] > 0)
             edge_density = float(edge_count) / float(ring_pixels)
 
-            if edge_density > 0.08:  # 8% edge density threshold
+            if edge_density > 0.018:  # 1.8% edge density threshold (clean banners have < 0.9%)
                 findings.append({
                     "pillar": "VISUAL",
                     "severity": "WARNING",
@@ -504,17 +596,42 @@ def audit_image_array(img_rgb, profile, file_label="Asset"):
 
 
 def audit_image_file(file_obj, profile):
-    """Audits an uploaded image file or file path."""
+    """
+    Audits an uploaded image file, SVG, or file path with:
+    1. Automatic EXIF orientation transpose
+    2. ICC / CMYK / Display P3 to sRGB normalization
+    3. SVG vector rendering via PyMuPDF
+    """
     try:
+        # Check for SVG
+        is_svg = False
+        if isinstance(file_obj, str) and file_obj.lower().endswith('.svg'):
+            is_svg = True
+        elif hasattr(file_obj, 'name') and str(file_obj.name).lower().endswith('.svg'):
+            is_svg = True
+
+        if is_svg and fitz is not None:
+            if isinstance(file_obj, str):
+                doc = fitz.open(file_obj)
+            else:
+                file_obj.seek(0)
+                doc = fitz.open(stream=file_obj.read(), filetype="svg")
+            pix = doc[0].get_pixmap(dpi=120)
+            pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            doc.close()
+            return audit_image_array(np.array(pil_img), profile)
+
+        # Standard Raster Images (PNG, JPEG, WebP, etc.)
         if isinstance(file_obj, (str, bytes)):
             if isinstance(file_obj, str):
-                pil_img = Image.open(file_obj).convert('RGB')
+                pil_img = Image.open(file_obj)
             else:
-                pil_img = Image.open(io.BytesIO(file_obj)).convert('RGB')
+                pil_img = Image.open(io.BytesIO(file_obj))
         else:
             file_obj.seek(0)
-            pil_img = Image.open(file_obj).convert('RGB')
+            pil_img = Image.open(file_obj)
 
+        pil_img = normalize_pil_image(pil_img)
         img_rgb = np.array(pil_img)
         return audit_image_array(img_rgb, profile)
     except Exception as e:

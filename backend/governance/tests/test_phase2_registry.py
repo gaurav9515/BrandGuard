@@ -35,7 +35,8 @@ class Phase2RuleRegistryTestCase(TestCase):
             email="admin2@novapay.io",
             password="adminpassword123",
             role="ADMIN",
-            department="Brand Governance Lead"
+            department="Brand Governance Lead",
+            brand_profile=self.profile
         )
         self.admin_token = generate_user_token(self.admin)
 
@@ -45,7 +46,8 @@ class Phase2RuleRegistryTestCase(TestCase):
             email="writer2@novapay.io",
             password="writerpassword123",
             role="CONTENT_WRITER",
-            department="Marketing Ops"
+            department="Marketing Ops",
+            brand_profile=self.profile
         )
         self.writer_token = generate_user_token(self.writer)
 

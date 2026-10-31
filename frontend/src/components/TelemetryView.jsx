@@ -1,85 +1,78 @@
 import React, { useState, useEffect } from 'react';
 import {
   Download,
-  ChevronDown,
-  ArrowUpRight,
-  TrendingUp,
-  AlertOctagon,
-  CheckCircle2,
-  Clock,
-  Layers,
-  ArrowRight,
   Flame,
   ShieldAlert,
   ShieldCheck,
   RefreshCw,
   Search,
-  Filter,
-  AlertTriangle,
-  FileText,
   Sliders,
-  ExternalLink,
+  Filter,
+  FileText,
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  User,
   Users,
-  Check,
-  X,
+  ChevronRight,
+  Info,
+  Calendar,
+  Layers,
   Sparkles,
+  X,
+  TrendingUp,
 } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
 import { API_BASE } from '../config/api';
+import SystemHealthCard from './SystemHealthCard';
 
 export default function TelemetryView({
   apiBase = API_BASE,
   onSelectRule,
   onViewAllRules,
 }) {
-  const [activeTab, setActiveTab] = useState('friction'); // 'friction' | 'fact_ledger'
-  const [minTriggers, setMinTriggers] = useState(10);
-  const [toastMessage, setToastMessage] = useState('');
+  const { user, token, isAdmin, isWriter } = useAuth();
+
+  // Tab switch for Admin: 'telemetry' | 'fact_ledger'
+  const [activeTab, setActiveTab] = useState('telemetry');
+
+  // Filters for Admin Telemetry
+  const [windowDays, setWindowDays] = useState(30); // 7 | 30 | 90
+  const [selectedChannel, setSelectedChannel] = useState('ALL');
+  const [diagnosisFilter, setDiagnosisFilter] = useState('ALL');
+  const [searchQuery, setSearchQuery] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [toastMessage, setToastMessage] = useState('');
 
-  // Blast radius modal state
-  const [blastModalOpen, setBlastModalOpen] = useState(false);
-  const [selectedFactForBlast, setSelectedFactForBlast] = useState(null);
-  const [blastData, setBlastData] = useState(null);
-  const [isBulkAuditing, setIsBulkAuditing] = useState(false);
-
-  // Telemetry metrics state
+  // Admin Telemetry Data
   const [telemetry, setTelemetry] = useState({
-    audit_volume: 1248,
-    audit_volume_delta: '↑ 12.4% vs prior',
-    first_pass_rate: 78.0,
-    first_pass_delta: '↑ 4.1 pts',
-    review_time_saved: '104 hrs',
-    review_time_saved_subtext: '≈ 5 min per audit',
-    open_findings: 864,
-    hard_blockers: 112,
-    warnings_count: 752,
-    weekly_trends: [
-      { week: 'W1', audits: 180, first_pass: 140 },
-      { week: 'W2', audits: 215, first_pass: 168 },
-      { week: 'W3', audits: 240, first_pass: 187 },
-      { week: 'W4', audits: 285, first_pass: 222 },
-      { week: 'W5', audits: 328, first_pass: 256 },
-    ],
-    categories: [
-      { name: 'Factual claims', count: 342, pct: 40 },
-      { name: 'Color & contrast', count: 251, pct: 29 },
-      { name: 'Voice & tone', count: 178, pct: 21 },
-      { name: 'Logo & layout', count: 93, pct: 10 },
-    ],
-    severity_breakdown: {
-      total: 864,
-      blockers: 112,
-      warnings: 752,
-      blocker_pct: 13,
-      warning_pct: 87,
+    kpis: {
+      audit_volume: 0,
+      first_pass_rate: 100.0,
+      review_time_saved_hours: 0,
+      review_time_saved_label: '0 hrs (estimated)',
+      total_violations: 0,
+      total_approved_overrides: 0,
+      min_triggers: 10,
+      minutes_per_audit: 5,
+      selected_window_days: 30,
     },
-    min_triggers: 10,
-    overall_friction_index: 28.4,
-    high_friction_count: 2,
-    friction_leaderboard: [],
+    rules: [],
+    writers: [],
+    trend_sparkline: [],
   });
 
-  // Fact Ledger state
+  // Drill-down Modal State
+  const [drillDownRule, setDrillDownRule] = useState(null);
+
+  // Writer Summary Data (Writer UI)
+  const [writerSummary, setWriterSummary] = useState({
+    writer: null,
+    my_top_rules: [],
+  });
+  const [loadingWriterData, setLoadingWriterData] = useState(false);
+
+  // Fact Ledger State (Admin)
   const [facts, setFacts] = useState([]);
   const [factSummary, setFactSummary] = useState({
     total_facts: 0,
@@ -87,32 +80,71 @@ export default function TelemetryView({
     expired_count: 0,
   });
 
+  // Blast radius modal state
+  const [blastModalOpen, setBlastModalOpen] = useState(false);
+  const [selectedFactForBlast, setSelectedFactForBlast] = useState(null);
+  const [blastData, setBlastData] = useState(null);
+  const [isBulkAuditing, setIsBulkAuditing] = useState(false);
+
   const showToast = (msg) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(''), 4000);
   };
 
+  // 1. Fetch Admin Telemetry
   const fetchTelemetry = async () => {
+    if (!isAdmin) return;
     setIsRefreshing(true);
     try {
-      const res = await fetch(`${apiBase}/api/telemetry/?min_triggers=${minTriggers}`);
+      const chanParam = selectedChannel !== 'ALL' ? `&channel=${selectedChannel}` : '';
+      const res = await fetch(`${apiBase}/api/telemetry/?days=${windowDays}${chanParam}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
       if (res.ok) {
         const data = await res.json();
-        setTelemetry((prev) => ({
-          ...prev,
-          ...data,
-        }));
+        setTelemetry(data);
+      } else if (res.status === 403) {
+        showToast('HTTP 403: Admin permissions required for organization telemetry.');
       }
     } catch {
-      // Fallback
+      showToast('Could not reach telemetry server.');
     } finally {
       setIsRefreshing(false);
     }
   };
 
-  const fetchFacts = async () => {
+  // 2. Fetch Writer Summary (Writer UI)
+  const fetchWriterSummary = async () => {
+    if (!isWriter) return;
+    setLoadingWriterData(true);
     try {
-      const res = await fetch(`${apiBase}/api/facts/`);
+      const res = await fetch(`${apiBase}/api/telemetry/writer-summary/`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setWriterSummary(data);
+      }
+    } catch {
+      // Fallback
+    } finally {
+      setLoadingWriterData(false);
+    }
+  };
+
+  // 3. Fetch Facts for Fact Ledger Tab
+  const fetchFacts = async () => {
+    if (!isAdmin) return;
+    try {
+      const res = await fetch(`${apiBase}/api/facts/`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
       if (res.ok) {
         const data = await res.json();
         setFacts(data.facts || []);
@@ -128,77 +160,166 @@ export default function TelemetryView({
   };
 
   useEffect(() => {
-    fetchTelemetry();
-  }, [apiBase, minTriggers]);
-
-  useEffect(() => {
-    fetchFacts();
-  }, [apiBase]);
-
-  // Open Blast Radius Modal for a Fact
-  const handleOpenBlastRadius = async (fact) => {
-    setSelectedFactForBlast(fact);
-    setBlastModalOpen(true);
-    setBlastData(null);
-    try {
-      const res = await fetch(`${apiBase}/api/facts/${fact.id}/blast-radius/`);
-      if (res.ok) {
-        const data = await res.json();
-        setBlastData(data);
-      }
-    } catch {
-      showToast('Could not load blast radius data.');
+    if (isAdmin) {
+      fetchTelemetry();
+      fetchFacts();
+    } else if (isWriter) {
+      fetchWriterSummary();
     }
+  }, [apiBase, token, isAdmin, isWriter, windowDays, selectedChannel]);
+
+  // Exports
+  const handleExportCSV = () => {
+    const chanParam = selectedChannel !== 'ALL' ? `&channel=${selectedChannel}` : '';
+    const url = `${apiBase}/api/telemetry/export-csv/?days=${windowDays}${chanParam}`;
+    fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => res.blob())
+      .then((blob) => {
+        const a = document.createElement('a');
+        a.href = window.URL.createObjectURL(blob);
+        a.download = `brandguard_telemetry_${windowDays}d.csv`;
+        a.click();
+        showToast('Telemetry CSV exported successfully.');
+      })
+      .catch(() => showToast('Export failed.'));
   };
 
-  // Run Bulk Re-Audit on a Fact
-  const handleRunBulkReAudit = async (factId) => {
-    setIsBulkAuditing(true);
-    try {
-      const res = await fetch(`${apiBase}/api/facts/${factId}/bulk-re-audit/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-      });
-      const data = await res.json();
-      if (res.ok) {
-        showToast(
-          `Bulk re-audit complete: ${data.blast_radius_total} assets evaluated, ${data.flagged_count} flagged as STALE_REAUDIT_REQUIRED.`
-        );
-        fetchFacts();
-        fetchTelemetry();
-        if (selectedFactForBlast) {
-          handleOpenBlastRadius(selectedFactForBlast);
-        }
-      } else {
-        showToast('Bulk re-audit failed.');
-      }
-    } catch {
-      showToast('Error executing bulk re-audit.');
-    } finally {
-      setIsBulkAuditing(false);
-    }
+  const handleExportPDF = () => {
+    const chanParam = selectedChannel !== 'ALL' ? `&channel=${selectedChannel}` : '';
+    const url = `${apiBase}/api/telemetry/export-pdf/?days=${windowDays}${chanParam}`;
+    fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((res) => res.blob())
+      .then((blob) => {
+        const a = document.createElement('a');
+        a.href = window.URL.createObjectURL(blob);
+        a.download = `brandguard_telemetry_${windowDays}d.pdf`;
+        a.click();
+        showToast('Executive PDF report generated and downloaded.');
+      })
+      .catch(() => showToast('PDF Export failed.'));
   };
 
-  const handleExport = () => {
-    const csvContent =
-      'data:text/csv;charset=utf-8,' +
-      'Rule ID,Rule Name,Findings,Severity,Override Rate,Friction Score,Friction Level\n' +
-      (telemetry.friction_leaderboard || [])
-        .map(
-          (r) =>
-            `${r.rule_id},"${r.rule_name}",${r.findings},${r.severity},${r.override_rate},${r.friction_score},${r.friction_level}`
-        )
-        .join('\n');
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `BrandGuard_Telemetry_Report_MinTriggers_${minTriggers}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    showToast('Governance report exported as CSV.');
-  };
+  // Filter rules by diagnosis & search
+  const filteredRules = (telemetry.rules || []).filter((r) => {
+    const matchesDiagnosis =
+      diagnosisFilter === 'ALL' || r.diagnosis === diagnosisFilter;
+    const matchesSearch =
+      !searchQuery ||
+      r.rule_code.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.title.toLowerCase().includes(searchQuery.toLowerCase());
+    return matchesDiagnosis && matchesSearch;
+  });
 
+  // ==============================================================
+  // RENDER: WRITER UI (Top 5 Triggered Rules & Training Tips)
+  // ==============================================================
+  if (isWriter && !isAdmin) {
+    return (
+      <div className="max-w-6xl mx-auto px-6 py-8">
+        {toastMessage && (
+          <div className="fixed top-16 right-6 z-50 bg-[#0F5132] text-white px-4 py-3 rounded-xl shadow-xl text-xs font-semibold flex items-center gap-2.5 border border-emerald-400/30">
+            <CheckCircle2 className="w-4 h-4 text-emerald-300 shrink-0" />
+            <span>{toastMessage}</span>
+          </div>
+        )}
+
+        {/* Writer Header */}
+        <div className="mb-8">
+          <div className="flex items-center gap-2 text-xs font-mono font-bold text-emerald-800 dark:text-emerald-400 uppercase tracking-wider mb-2">
+            <span>MY GOVERNANCE WORKSPACE</span>
+            <span>·</span>
+            <span>PERSONAL COMPLIANCE COACH</span>
+          </div>
+          <h1 className="text-2xl sm:text-3xl font-bold text-zinc-900 dark:text-white tracking-tight">
+            My Top Triggered Rules &amp; Coaching Tips
+          </h1>
+          <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1 max-w-2xl leading-relaxed">
+            Personalized coaching based on rules flagged during your recent pre-flight audits. Adhere to these actionable tips to achieve zero-blocker clearances on your first pass.
+          </p>
+        </div>
+
+        {/* Top 5 Rules Cards */}
+        {loadingWriterData ? (
+          <div className="py-16 text-center text-zinc-400 text-xs">
+            Loading your compliance coaching data...
+          </div>
+        ) : (writerSummary.my_top_rules || []).length === 0 ? (
+          <div className="bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 rounded-2xl p-8 text-center max-w-lg mx-auto">
+            <Sparkles className="w-8 h-8 text-emerald-600 dark:text-emerald-400 mx-auto mb-3" />
+            <h3 className="text-sm font-bold text-emerald-900 dark:text-emerald-200">
+              Clean Governance Track Record
+            </h3>
+            <p className="text-xs text-emerald-700 dark:text-emerald-300 mt-1 leading-relaxed">
+              You have not triggered any persistent rule violations! All recent draft submissions adhere strictly to brand and fact guidelines.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {writerSummary.my_top_rules.map((rule, idx) => (
+              <div
+                key={rule.rule_code}
+                className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-5 shadow-xs hover:border-zinc-300 dark:hover:border-zinc-700 transition-colors"
+              >
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-zinc-100 dark:border-zinc-800">
+                  <div className="flex items-center gap-3">
+                    <span className="w-6 h-6 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 text-xs font-bold font-mono flex items-center justify-center">
+                      #{idx + 1}
+                    </span>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono font-bold text-xs text-zinc-900 dark:text-white">
+                          {rule.rule_code}
+                        </span>
+                        <span
+                          className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase ${
+                            rule.severity === 'BLOCKER'
+                              ? 'bg-rose-100 dark:bg-rose-950 text-rose-800 dark:text-rose-300 border border-rose-200 dark:border-rose-800'
+                              : 'bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800'
+                          }`}
+                        >
+                          {rule.severity}
+                        </span>
+                        <span className="text-[10px] font-mono uppercase bg-zinc-100 dark:bg-zinc-800 text-zinc-500 px-1.5 py-0.5 rounded">
+                          {rule.pillar}
+                        </span>
+                      </div>
+                      <h4 className="text-sm font-semibold text-zinc-800 dark:text-zinc-200 mt-0.5">
+                        {rule.title}
+                      </h4>
+                    </div>
+                  </div>
+
+                  <div className="text-right">
+                    <span className="text-xs text-zinc-400">Triggered:</span>{' '}
+                    <span className="font-mono font-bold text-zinc-900 dark:text-white text-sm">
+                      {rule.trigger_count} times
+                    </span>
+                  </div>
+                </div>
+
+                {/* Training Tip */}
+                <div className="mt-3.5 bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200/80 dark:border-emerald-800/50 rounded-lg p-3.5 flex items-start gap-2.5">
+                  <Sparkles className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+                  <div className="text-xs text-emerald-900 dark:text-emerald-200 leading-relaxed">
+                    <span className="font-bold">Coaching Tip: </span>
+                    {rule.training_tip}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ==============================================================
+  // RENDER: ADMIN UI (Full Governance Telemetry & Ambiguity Diagnostic)
+  // ==============================================================
   return (
     <div className="max-w-7xl mx-auto px-6 py-8">
       {/* Toast Notification */}
@@ -209,66 +330,29 @@ export default function TelemetryView({
         </div>
       )}
 
-      {/* Top Breadcrumb & Controls */}
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-[11px] font-mono font-semibold tracking-wider text-emerald-800 uppercase flex items-center gap-1.5">
-          <span>GOVERNANCE INTELLIGENCE</span>
-          <span className="text-zinc-400 font-normal">·</span>
-          <span>TELEMETRY &amp; FACT LEDGER</span>
-          <span className="text-zinc-400 font-normal">·</span>
-          <span>FRICTION INDEX</span>
-        </div>
-
-        {/* Tab Switcher */}
-        <div className="flex items-center gap-1 bg-zinc-100 p-1 rounded-xl border border-zinc-200">
-          <button
-            type="button"
-            onClick={() => setActiveTab('friction')}
-            className={`text-xs px-3.5 py-1.5 rounded-lg font-semibold transition-all cursor-pointer ${
-              activeTab === 'friction'
-                ? 'bg-white text-zinc-950 shadow-xs'
-                : 'text-zinc-600 hover:text-zinc-900'
-            }`}
-          >
-            Friction Score &amp; Telemetry
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('fact_ledger')}
-            className={`text-xs px-3.5 py-1.5 rounded-lg font-semibold transition-all flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'fact_ledger'
-                ? 'bg-white text-zinc-950 shadow-xs'
-                : 'text-zinc-600 hover:text-zinc-900'
-            }`}
-          >
-            <span>Fact Ledger &amp; Blast Radius</span>
-            {factSummary.expired_count > 0 && (
-              <span className="w-2 h-2 rounded-full bg-rose-600"></span>
-            )}
-          </button>
-        </div>
-      </div>
-
-      {/* Header and Global Action Buttons */}
+      {/* Top Header & Tab Switcher */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold text-zinc-900 tracking-tight">
-            Better content. Fewer preventable risks.
+          <div className="flex items-center gap-2 text-[11px] font-mono font-bold text-emerald-800 dark:text-emerald-400 uppercase tracking-wider mb-1">
+            <span>GOVERNANCE INTELLIGENCE</span>
+            <span>·</span>
+            <span>LIVE TELEMETRY &amp; AMBIGUITY DIAGNOSTIC</span>
+          </div>
+          <h1 className="text-2xl sm:text-3xl font-bold text-zinc-900 dark:text-white tracking-tight">
+            Governance Velocity &amp; Policy Health
           </h1>
-          <p className="text-xs text-zinc-500 mt-1 max-w-2xl leading-relaxed">
-            Measure workflow friction across deterministic linting rules, audit volume velocity, and manage retroactive Fact Ledger blast radius.
+          <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1 max-w-2xl leading-relaxed">
+            Real-time telemetry computed dynamically from verified audit events within the selected window. Diagnose guideline ambiguity, friction scores, and creator adherence.
           </p>
         </div>
 
-        <div className="flex items-center gap-2.5">
+        {/* Global Action Buttons */}
+        <div className="flex items-center gap-2.5 flex-wrap">
           <button
             type="button"
-            onClick={() => {
-              fetchTelemetry();
-              fetchFacts();
-            }}
+            onClick={fetchTelemetry}
             disabled={isRefreshing}
-            className="border border-[#E5E7EB] bg-white text-zinc-700 text-xs px-3.5 py-2 rounded-lg flex items-center gap-1.5 hover:bg-zinc-50 font-semibold shadow-xs cursor-pointer transition-colors"
+            className="border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 text-xs px-3.5 py-2 rounded-lg flex items-center gap-1.5 hover:bg-zinc-50 dark:hover:bg-zinc-800 font-semibold shadow-2xs cursor-pointer transition-colors"
           >
             <RefreshCw className={`w-3.5 h-3.5 text-zinc-500 ${isRefreshing ? 'animate-spin' : ''}`} />
             <span>Refresh</span>
@@ -276,581 +360,466 @@ export default function TelemetryView({
 
           <button
             type="button"
-            onClick={handleExport}
-            className="bg-zinc-900 hover:bg-zinc-800 text-white text-xs px-4 py-2 rounded-lg flex items-center gap-1.5 font-semibold transition-colors shadow-xs cursor-pointer"
+            onClick={handleExportCSV}
+            className="border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 text-xs px-3.5 py-2 rounded-lg flex items-center gap-1.5 hover:bg-zinc-50 dark:hover:bg-zinc-800 font-semibold shadow-2xs cursor-pointer transition-colors"
           >
-            <Download className="w-3.5 h-3.5" />
+            <Download className="w-3.5 h-3.5 text-zinc-500" />
             <span>Export CSV</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleExportPDF}
+            className="bg-zinc-900 dark:bg-zinc-100 hover:bg-zinc-800 dark:hover:bg-white text-white dark:text-zinc-900 text-xs px-4 py-2 rounded-lg flex items-center gap-1.5 font-semibold transition-colors shadow-xs cursor-pointer"
+          >
+            <FileText className="w-3.5 h-3.5" />
+            <span>Export Executive PDF</span>
           </button>
         </div>
       </div>
 
-      {/* ============================================================== */}
-      {/* VIEW 1: FRICTION SCORE & TELEMETRY DASHBOARD                   */}
-      {/* ============================================================== */}
-      {activeTab === 'friction' && (
-        <div className="space-y-6">
-          {/* Top Metric Cards (4 Columns) */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            {/* Card 1: Audit volume */}
-            <div className="bg-white border border-[#E5E7EB] rounded-xl p-5 shadow-xs">
-              <div className="text-xs font-semibold text-zinc-500 mb-1">Audit Volume</div>
-              <div className="text-3xl font-bold text-zinc-900 font-sans tracking-tight">
-                {telemetry.audit_volume.toLocaleString()}
-              </div>
-              <div className="text-xs text-emerald-700 font-semibold mt-1">
-                {telemetry.audit_volume_delta}
-              </div>
-            </div>
-
-            {/* Card 2: First-pass rate */}
-            <div className="bg-white border border-[#E5E7EB] rounded-xl p-5 shadow-xs">
-              <div className="text-xs font-semibold text-zinc-500 mb-1">First-Pass Rate</div>
-              <div className="text-3xl font-bold text-zinc-900 font-sans tracking-tight">
-                {telemetry.first_pass_rate.toFixed(1)}%
-              </div>
-              <div className="text-xs text-emerald-700 font-semibold mt-1">
-                {telemetry.first_pass_delta}
-              </div>
-            </div>
-
-            {/* Card 3: Overall Friction Index */}
-            <div className="bg-white border border-[#E5E7EB] rounded-xl p-5 shadow-xs">
-              <div className="text-xs font-semibold text-zinc-500 mb-1 flex items-center justify-between">
-                <span>Friction Score Index</span>
-                <Flame className="w-3.5 h-3.5 text-amber-500" />
-              </div>
-              <div className="flex items-baseline gap-2">
-                <span className="text-3xl font-bold text-zinc-900 font-sans tracking-tight">
-                  {telemetry.overall_friction_index}
-                </span>
-                <span className="text-xs font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
-                  Low Friction
-                </span>
-              </div>
-              <div className="text-xs text-zinc-400 mt-1">
-                Weighted delay index across active rules
-              </div>
-            </div>
-
-            {/* Card 4: Open findings */}
-            <div className="bg-white border border-[#E5E7EB] rounded-xl p-5 shadow-xs">
-              <div className="text-xs font-semibold text-zinc-500 mb-1">Open Findings</div>
-              <div className="text-3xl font-bold text-zinc-900 font-sans tracking-tight">
-                {telemetry.open_findings}
-              </div>
-              <div className="text-xs text-rose-600 font-semibold mt-1">
-                {telemetry.hard_blockers} hard blockers · {telemetry.warnings_count} warnings
-              </div>
-            </div>
-          </div>
-
-          {/* Friction Score Leaderboard Section */}
-          <div className="bg-white border border-[#E5E7EB] rounded-xl overflow-hidden shadow-xs">
-            {/* Header with Minimum Trigger Count Controls */}
-            <div className="p-5 border-b border-[#E5E7EB] flex flex-col md:flex-row md:items-center justify-between gap-4 bg-zinc-50/50">
-              <div>
-                <h2 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
-                  <Flame className="w-4 h-4 text-amber-600" />
-                  <span>Rule Friction Score Leaderboard</span>
-                </h2>
-                <p className="text-xs text-zinc-500 mt-0.5">
-                  Calculates governance friction: Trigger Count × (1 + Override Rate × 2) × Severity Weight.
-                </p>
-              </div>
-
-              {/* Minimum Trigger Count Filter Bar */}
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-semibold text-zinc-600 flex items-center gap-1.5">
-                  <Sliders className="w-3.5 h-3.5 text-zinc-500" />
-                  <span>Min Triggers Filter:</span>
-                </span>
-                <div className="flex items-center gap-1 bg-white border border-zinc-200 rounded-lg p-1 shadow-2xs">
-                  {[0, 5, 10, 20, 50].map((val) => (
-                    <button
-                      key={val}
-                      type="button"
-                      onClick={() => setMinTriggers(val)}
-                      className={`text-xs px-2.5 py-1 rounded font-mono font-bold transition-colors cursor-pointer ${
-                        minTriggers === val
-                          ? 'bg-zinc-900 text-white'
-                          : 'text-zinc-600 hover:text-zinc-950 hover:bg-zinc-100'
-                      }`}
-                    >
-                      {val === 0 ? 'All' : `≥ ${val}`}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            {/* Leaderboard Table */}
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-[#F9FAFB] text-zinc-500 font-semibold uppercase tracking-wider text-[11px] border-b border-[#E5E7EB]">
-                  <tr>
-                    <th scope="col" className="px-6 py-3.5">RULE CODE</th>
-                    <th scope="col" className="px-6 py-3.5">RULE NAME &amp; PILLAR</th>
-                    <th scope="col" className="px-6 py-3.5">TRIGGERS</th>
-                    <th scope="col" className="px-6 py-3.5">OVERRIDE RATE</th>
-                    <th scope="col" className="px-6 py-3.5">SEVERITY</th>
-                    <th scope="col" className="px-6 py-3.5">FRICTION SCORE</th>
-                    <th scope="col" className="px-6 py-3.5">STRATEGIC RECOMMENDATION</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#E5E7EB] text-zinc-800">
-                  {telemetry.friction_leaderboard.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="px-6 py-8 text-center text-zinc-400">
-                        No rules triggered ≥ {minTriggers} times. Try selecting a lower trigger threshold.
-                      </td>
-                    </tr>
-                  ) : (
-                    telemetry.friction_leaderboard.map((row) => (
-                      <tr
-                        key={row.rule_id}
-                        onClick={() => onSelectRule && onSelectRule(row.rule_id)}
-                        className="hover:bg-zinc-50/70 transition-colors cursor-pointer"
-                      >
-                        <td className="px-6 py-4 font-mono font-bold text-zinc-900">
-                          {row.rule_id}
-                        </td>
-                        <td className="px-6 py-4">
-                          <div className="font-semibold text-zinc-900">{row.rule_name}</div>
-                          <span className="text-[10px] font-mono uppercase text-zinc-500 bg-zinc-100 px-1.5 py-0.2 rounded mt-0.5 inline-block">
-                            {row.pillar || 'GENERAL'}
-                          </span>
-                        </td>
-                        <td className="px-6 py-4 font-mono font-bold text-zinc-900">
-                          {row.findings}
-                        </td>
-                        <td className="px-6 py-4 font-mono font-semibold text-zinc-700">
-                          {row.override_rate}
-                        </td>
-                        <td className="px-6 py-4">
-                          <span
-                            className={`font-mono text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${
-                              row.severity === 'Blocker'
-                                ? 'bg-rose-100 text-rose-800 border border-rose-300'
-                                : 'bg-amber-100 text-amber-800 border border-amber-300'
-                            }`}
-                          >
-                            {row.severity}
-                          </span>
-                        </td>
-                        <td className="px-6 py-4">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono font-extrabold text-sm text-zinc-900">
-                              {row.friction_score}
-                            </span>
-                            <span
-                              className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded uppercase ${
-                                row.friction_level === 'HIGH'
-                                  ? 'bg-rose-100 text-rose-800'
-                                  : row.friction_level === 'MEDIUM'
-                                  ? 'bg-amber-100 text-amber-800'
-                                  : 'bg-emerald-100 text-emerald-800'
-                              }`}
-                            >
-                              {row.friction_level}
-                            </span>
-                          </div>
-                        </td>
-                        <td className="px-6 py-4 text-zinc-600 max-w-xs leading-relaxed text-[11px]">
-                          {row.recommendation}
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* Charts Row: Audit Volume Trend & Categories */}
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Card 1: Audit Volume & First-Pass Trend */}
-            <div className="lg:col-span-7 bg-white border border-[#E5E7EB] rounded-xl p-6 shadow-xs">
-              <div className="flex items-center justify-between mb-6">
-                <div>
-                  <h3 className="text-sm font-bold text-zinc-900">
-                    Audit Volume &amp; First-Pass Trend
-                  </h3>
-                  <p className="text-xs text-zinc-500 mt-0.5">5-week rolling compliance velocity</p>
-                </div>
-                <div className="flex items-center gap-3 text-xs text-zinc-600">
-                  <span className="flex items-center gap-1.5 font-medium">
-                    <span className="w-2.5 h-2.5 rounded-xs bg-[#0F5132] inline-block"></span>
-                    <span>Audits</span>
-                  </span>
-                  <span className="flex items-center gap-1.5 font-medium">
-                    <span className="w-2.5 h-2.5 rounded-xs bg-[#CBE7D4] inline-block"></span>
-                    <span>First-pass</span>
-                  </span>
-                </div>
-              </div>
-
-              {/* Bar Chart Container */}
-              <div className="h-44 flex items-end justify-between gap-3 px-4 pt-4 border-b border-[#E5E7EB]">
-                {telemetry.weekly_trends.map((w, idx) => {
-                  const barHeights = [
-                    { total: '48%', audits: '45%' },
-                    { total: '65%', audits: '50%' },
-                    { total: '65%', audits: '52%' },
-                    { total: '86%', audits: '48%' },
-                    { total: '86%', audits: '52%' },
-                  ];
-                  const h = barHeights[idx] || { total: '70%', audits: '48%' };
-
-                  return (
-                    <div key={w.week} className="flex-1 flex flex-col items-center h-full justify-end group">
-                      <div className="relative w-full max-w-[54px] flex flex-col justify-end" style={{ height: h.total }}>
-                        <div className="w-full bg-[#CBE7D4] rounded-t-xs flex-1 transition-all"></div>
-                        <div className="w-full bg-[#0F5132] transition-all" style={{ height: h.audits }}></div>
-                      </div>
-                      <span className="text-[11px] font-mono text-zinc-500 mt-2 font-semibold">
-                        {w.week}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Card 2: Findings by Category */}
-            <div className="lg:col-span-5 bg-white border border-[#E5E7EB] rounded-xl p-6 shadow-xs">
-              <div className="flex items-baseline justify-between mb-4">
-                <h3 className="text-sm font-bold text-zinc-900">Findings by Category</h3>
-                <div className="text-right">
-                  <span className="text-2xl font-bold text-zinc-900 font-sans tracking-tight">
-                    864
-                  </span>
-                  <span className="text-xs text-zinc-400 font-normal ml-1">total</span>
-                </div>
-              </div>
-
-              <div className="space-y-4 pt-2">
-                {telemetry.categories.map((cat) => (
-                  <div key={cat.name} className="space-y-1.5">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-zinc-800 font-semibold">{cat.name}</span>
-                      <span className="font-mono text-zinc-700 font-bold">{cat.count}</span>
-                    </div>
-                    <div className="w-full bg-zinc-100 rounded-full h-2.5 overflow-hidden">
-                      <div
-                        className="bg-[#0F5132] h-full rounded-full transition-all duration-500"
-                        style={{ width: `${cat.pct}%` }}
-                      ></div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ============================================================== */}
-      {/* VIEW 2: FACT LEDGER, EXPIRY ALERTS & BLAST RADIUS             */}
-      {/* ============================================================== */}
-      {activeTab === 'fact_ledger' && (
-        <div className="space-y-6">
-          {/* Fact Summary Metrics */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div className="bg-white border border-[#E5E7EB] rounded-xl p-5 shadow-xs">
-              <div className="text-xs font-semibold text-zinc-500 mb-1">Total Verified Truth Claims</div>
-              <div className="text-3xl font-bold text-zinc-900 font-sans tracking-tight">
-                {factSummary.total_facts}
-              </div>
-              <div className="text-xs text-zinc-500 mt-1">Living Source of Truth Ledger</div>
-            </div>
-
-            <div className="bg-white border border-[#E5E7EB] rounded-xl p-5 shadow-xs">
-              <div className="text-xs font-semibold text-zinc-500 mb-1">Expiring Soon (≤ 30 days)</div>
-              <div className="flex items-baseline gap-2">
-                <span className="text-3xl font-bold text-amber-700 font-sans tracking-tight">
-                  {factSummary.expiring_soon_count}
-                </span>
-                <span className="text-xs text-amber-800 font-semibold bg-amber-50 px-2 py-0.5 rounded">
-                  Requires Review
-                </span>
-              </div>
-              <div className="text-xs text-zinc-400 mt-1">Upcoming certificate / rate cutoffs</div>
-            </div>
-
-            <div className="bg-white border border-[#E5E7EB] border-l-4 border-l-rose-600 rounded-xl p-5 shadow-xs">
-              <div className="text-xs font-semibold text-zinc-500 mb-1">Expired Truths</div>
-              <div className="flex items-baseline gap-2">
-                <span className="text-3xl font-bold text-rose-700 font-sans tracking-tight">
-                  {factSummary.expired_count}
-                </span>
-                <span className="text-xs text-rose-800 font-semibold bg-rose-50 px-2 py-0.5 rounded">
-                  Blast Radius Alert
-                </span>
-              </div>
-              <div className="text-xs text-rose-600 mt-1 font-medium">
-                Published assets may cite outdated claims
-              </div>
-            </div>
-          </div>
-
-          {/* Expiry Critical Alert Banner (if expired facts exist) */}
-          {factSummary.expired_count > 0 && (
-            <div className="bg-rose-50 border-2 border-rose-400 rounded-xl p-4 text-xs text-rose-950 flex items-start justify-between gap-4 shadow-xs">
-              <div className="flex items-start gap-3">
-                <ShieldAlert className="w-5 h-5 text-rose-700 shrink-0 mt-0.5" />
-                <div className="space-y-1">
-                  <div className="font-bold uppercase tracking-wider text-[11px] text-rose-900">
-                    Critical Fact Expiry &amp; Blast Radius Notice
-                  </div>
-                  <p className="leading-relaxed">
-                    One or more regulatory facts have expired in the NovaPay Fact Ledger. Any marketing assets citing these outdated claims pose compliance exposure and must be retroactively re-audited.
-                  </p>
-                </div>
-              </div>
-
+      {/* Filter Bar: Window & Channel */}
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-4 mb-6 shadow-2xs flex flex-col md:flex-row md:items-center justify-between gap-4">
+        {/* Time Window Buttons: 7 / 30 / 90 days */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-zinc-500 flex items-center gap-1.5">
+            <Clock className="w-3.5 h-3.5" />
+            <span>Window:</span>
+          </span>
+          <div className="flex items-center gap-1 bg-zinc-100 dark:bg-zinc-800 p-1 rounded-lg">
+            {[7, 30, 90].map((d) => (
               <button
+                key={d}
                 type="button"
-                onClick={() => {
-                  const expired = facts.find((f) => f.expiry_status === 'EXPIRED') || facts[0];
-                  if (expired) handleOpenBlastRadius(expired);
-                }}
-                className="bg-rose-700 hover:bg-rose-800 text-white font-semibold px-4 py-2 rounded-lg text-xs shrink-0 cursor-pointer transition-colors shadow-xs"
+                onClick={() => setWindowDays(d)}
+                className={`text-xs px-3 py-1 rounded-md font-semibold transition-colors cursor-pointer ${
+                  windowDays === d
+                    ? 'bg-white dark:bg-zinc-900 text-zinc-900 dark:text-white shadow-2xs'
+                    : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'
+                }`}
               >
-                Inspect Blast Radius →
+                {d} Days
               </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Channel Filter */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-zinc-500 flex items-center gap-1.5">
+            <Filter className="w-3.5 h-3.5" />
+            <span>Channel:</span>
+          </span>
+          <select
+            value={selectedChannel}
+            onChange={(e) => setSelectedChannel(e.target.value)}
+            className="bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-xs font-semibold rounded-lg px-3 py-1.5 text-zinc-800 dark:text-zinc-200 focus:outline-hidden"
+          >
+            <option value="ALL">All Channels</option>
+            <option value="LINKEDIN_POST">LinkedIn Post</option>
+            <option value="PRESS_RELEASE">Press Release</option>
+            <option value="PITCH_DECK">Pitch Deck</option>
+            <option value="LANDING_PAGE">Landing Page</option>
+          </select>
+        </div>
+      </div>
+
+      {/* KPI Cards (4 Cards) */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        {/* Card 1: Audit volume */}
+        <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-5 shadow-2xs">
+          <div className="text-xs font-semibold text-zinc-500 mb-1">Audit Volume</div>
+          <div className="text-3xl font-bold text-zinc-900 dark:text-white tracking-tight">
+            {(telemetry.kpis?.audit_volume || 0).toLocaleString()}
+          </div>
+          <div className="text-[11px] text-zinc-400 mt-1">
+            Distinct submissions scanned in {windowDays}d window
+          </div>
+        </div>
+
+        {/* Card 2: First-pass rate */}
+        <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-5 shadow-2xs">
+          <div className="text-xs font-semibold text-zinc-500 mb-1">First-Pass Rate</div>
+          <div className="text-3xl font-bold text-zinc-900 dark:text-white tracking-tight">
+            {(telemetry.kpis?.first_pass_rate || 100.0).toFixed(1)}%
+          </div>
+          <div className="text-[11px] text-emerald-600 dark:text-emerald-400 font-medium mt-1">
+            Version 1 clean with 0 open blockers
+          </div>
+        </div>
+
+        {/* Card 3: Review time saved */}
+        <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-5 shadow-2xs">
+          <div className="text-xs font-semibold text-zinc-500 mb-1 flex items-center justify-between">
+            <span>Review Time Saved</span>
+            <span className="text-[10px] font-mono text-zinc-400 font-bold bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded">
+              estimated
+            </span>
+          </div>
+          <div className="text-3xl font-bold text-zinc-900 dark:text-white tracking-tight">
+            {telemetry.kpis?.review_time_saved_hours || 0} hrs
+          </div>
+          <div className="text-[11px] text-zinc-400 mt-1">
+            Based on admin setting: {telemetry.kpis?.minutes_per_audit || 5} min/audit
+          </div>
+        </div>
+
+        {/* Card 4: Violations & Overrides */}
+        <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-5 shadow-2xs">
+          <div className="text-xs font-semibold text-zinc-500 mb-1">Total Rule Violations</div>
+          <div className="text-3xl font-bold text-zinc-900 dark:text-white tracking-tight">
+            {telemetry.kpis?.total_violations || 0}
+          </div>
+          <div className="text-[11px] text-zinc-400 mt-1">
+            {telemetry.kpis?.total_approved_overrides || 0} exceptions approved
+          </div>
+        </div>
+      </div>
+
+      {/* Rule Performance & Ambiguity Diagnostic Table */}
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl overflow-hidden shadow-2xs mb-8">
+        {/* Table Controls Header */}
+        <div className="p-5 border-b border-zinc-200 dark:border-zinc-800 flex flex-col md:flex-row md:items-center justify-between gap-4 bg-zinc-50/50 dark:bg-zinc-800/30">
+          <div>
+            <h2 className="text-sm font-bold text-zinc-900 dark:text-white flex items-center gap-2">
+              <Flame className="w-4 h-4 text-amber-500" />
+              <span>Ambiguity Diagnostic &amp; Friction Leaderboard</span>
+            </h2>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
+              Diagnosis requires ≥ {telemetry.kpis?.min_triggers || 10} triggers. Friction = override_rate × ln(triggers + 1).
+            </p>
+          </div>
+
+          {/* Diagnosis Filter & Search */}
+          <div className="flex items-center gap-3 flex-wrap">
+            <div className="flex items-center gap-1 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg p-1 text-xs">
+              {[
+                { id: 'ALL', label: 'All' },
+                { id: 'NEEDS_CLARIFICATION', label: 'Clarification' },
+                { id: 'TRAINING_GAP', label: 'Training Gap' },
+                { id: 'HEALTHY_GOVERNANCE', label: 'Healthy' },
+                { id: 'NOT_ENOUGH_DATA', label: '< 10 Data' },
+              ].map((diag) => (
+                <button
+                  key={diag.id}
+                  type="button"
+                  onClick={() => setDiagnosisFilter(diag.id)}
+                  className={`px-2.5 py-1 rounded font-semibold transition-colors cursor-pointer text-[11px] ${
+                    diagnosisFilter === diag.id
+                      ? 'bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900'
+                      : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+                  }`}
+                >
+                  {diag.label}
+                </button>
+              ))}
             </div>
-          )}
 
-          {/* Fact Ledger Table */}
-          <div className="bg-white border border-[#E5E7EB] rounded-xl overflow-hidden shadow-xs">
-            <div className="p-5 border-b border-[#E5E7EB] flex items-center justify-between bg-zinc-50/50">
-              <div>
-                <h2 className="text-sm font-bold text-zinc-900">
-                  NovaPay Truth Claims &amp; Regulatory Fact Ledger
-                </h2>
-                <p className="text-xs text-zinc-500 mt-0.5">
-                  Single source of truth for numerical rates, settlement speeds, and certifications.
-                </p>
-              </div>
-
-              <div className="text-xs font-mono text-zinc-400">
-                Synchronized with Pre-Flight Compiler
-              </div>
-            </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-[#F9FAFB] text-zinc-500 font-semibold uppercase tracking-wider text-[11px] border-b border-[#E5E7EB]">
-                  <tr>
-                    <th scope="col" className="px-6 py-3.5">FACT CODE</th>
-                    <th scope="col" className="px-6 py-3.5">CATEGORY &amp; VERIFIED CLAIM TRUTH</th>
-                    <th scope="col" className="px-6 py-3.5">VALID UNTIL</th>
-                    <th scope="col" className="px-6 py-3.5">EXPIRY STATUS</th>
-                    <th scope="col" className="px-6 py-3.5">BLAST RADIUS</th>
-                    <th scope="col" className="px-6 py-3.5 text-right">GOVERNANCE ACTIONS</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#E5E7EB] text-zinc-800">
-                  {facts.map((fact) => (
-                    <tr key={fact.id} className="hover:bg-zinc-50/70 transition-colors">
-                      <td className="px-6 py-4 font-mono font-bold text-zinc-900">
-                        {fact.fact_code}
-                      </td>
-                      <td className="px-6 py-4 max-w-sm">
-                        <div className="font-semibold text-zinc-900">{fact.category}</div>
-                        <div className="text-zinc-600 mt-0.5 italic">“{fact.claim_truth}”</div>
-                        {fact.superseded_by_text && (
-                          <div className="text-[11px] text-amber-800 mt-1 font-medium">
-                            Superseded by: {fact.superseded_by_text}
-                          </div>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 font-mono text-zinc-600 whitespace-nowrap">
-                        {fact.valid_until}
-                        <div className="text-[10px] text-zinc-400">
-                          {fact.days_until_expiry < 0
-                            ? `Expired ${Math.abs(fact.days_until_expiry)}d ago`
-                            : `Expires in ${fact.days_until_expiry}d`}
-                        </div>
-                      </td>
-                      <td className="px-6 py-4">
-                        <span
-                          className={`font-mono text-[10px] px-2.5 py-0.5 rounded-full font-bold uppercase ${
-                            fact.expiry_status === 'ACTIVE'
-                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                              : fact.expiry_status === 'EXPIRING_SOON'
-                              ? 'bg-amber-100 text-amber-800 border border-amber-300'
-                              : 'bg-rose-100 text-rose-800 border border-rose-300'
-                          }`}
-                        >
-                          {fact.expiry_status === 'EXPIRING_SOON' ? 'EXPIRING SOON' : fact.expiry_status}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4">
-                        <button
-                          type="button"
-                          onClick={() => handleOpenBlastRadius(fact)}
-                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold bg-zinc-100 hover:bg-zinc-200 text-zinc-800 transition-colors cursor-pointer"
-                        >
-                          <Users className="w-3.5 h-3.5 text-zinc-500" />
-                          <span>{fact.blast_radius_count || 0} Assets</span>
-                        </button>
-                      </td>
-                      <td className="px-6 py-4 text-right">
-                        <div className="flex items-center justify-end gap-2">
-                          <button
-                            type="button"
-                            onClick={() => handleOpenBlastRadius(fact)}
-                            className="text-xs font-semibold text-zinc-700 hover:text-zinc-950 px-2.5 py-1.5 border border-zinc-200 rounded-lg hover:bg-zinc-50 transition cursor-pointer"
-                          >
-                            Inspect
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRunBulkReAudit(fact.id)}
-                            className="text-xs font-semibold text-[#0F5132] hover:text-[#0B4226] px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded-lg transition cursor-pointer"
-                          >
-                            Bulk Re-Audit
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-2.5 top-2.5" />
+              <input
+                type="text"
+                placeholder="Search rule..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="pl-8 pr-3 py-1.5 text-xs bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-zinc-800 dark:text-zinc-200 placeholder-zinc-400 focus:outline-hidden"
+              />
             </div>
           </div>
         </div>
-      )}
+
+        {/* Table Content */}
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-zinc-50 dark:bg-zinc-800/60 text-zinc-500 font-semibold uppercase tracking-wider text-[11px] border-b border-zinc-200 dark:border-zinc-800">
+              <tr>
+                <th scope="col" className="px-5 py-3.5">RULE CODE</th>
+                <th scope="col" className="px-5 py-3.5">TITLE &amp; PILLAR</th>
+                <th scope="col" className="px-5 py-3.5">SEVERITY</th>
+                <th scope="col" className="px-5 py-3.5">TRIGGERS</th>
+                <th scope="col" className="px-5 py-3.5">OVERRIDES</th>
+                <th scope="col" className="px-5 py-3.5">OVERRIDE %</th>
+                <th scope="col" className="px-5 py-3.5">FRICTION</th>
+                <th scope="col" className="px-5 py-3.5">DIAGNOSIS</th>
+                <th scope="col" className="px-5 py-3.5">LAST TRIGGERED</th>
+                <th scope="col" className="px-5 py-3.5">ACTION</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 text-zinc-800 dark:text-zinc-200">
+              {filteredRules.length === 0 ? (
+                <tr>
+                  <td colSpan={10} className="px-6 py-12 text-center text-zinc-400 text-xs">
+                    No rules matching current filter criteria.
+                  </td>
+                </tr>
+              ) : (
+                filteredRules.map((row) => (
+                  <tr
+                    key={row.id || row.rule_code}
+                    className="hover:bg-zinc-50/70 dark:hover:bg-zinc-800/40 transition-colors"
+                  >
+                    <td className="px-5 py-4 font-mono font-bold text-zinc-900 dark:text-white">
+                      {row.rule_code}
+                    </td>
+                    <td className="px-5 py-4">
+                      <div className="font-semibold text-zinc-900 dark:text-zinc-100">{row.title}</div>
+                      <span className="text-[10px] font-mono uppercase text-zinc-500 bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded mt-0.5 inline-block">
+                        {row.pillar}
+                      </span>
+                    </td>
+                    <td className="px-5 py-4">
+                      <span
+                        className={`font-mono text-[10px] px-2 py-0.5 rounded font-bold uppercase ${
+                          row.severity === 'BLOCKER'
+                            ? 'bg-rose-100 dark:bg-rose-950 text-rose-800 dark:text-rose-300 border border-rose-200 dark:border-rose-800'
+                            : 'bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800'
+                        }`}
+                      >
+                        {row.severity}
+                      </span>
+                    </td>
+                    <td className="px-5 py-4 font-mono font-bold text-zinc-900 dark:text-white">
+                      {row.triggers}
+                    </td>
+                    <td className="px-5 py-4 font-mono text-zinc-600 dark:text-zinc-400">
+                      {row.overrides}
+                    </td>
+                    <td className="px-5 py-4 font-mono font-semibold">
+                      {row.override_rate_pct}%
+                    </td>
+                    <td className="px-5 py-4 font-mono font-extrabold text-zinc-900 dark:text-white">
+                      {row.friction_score}
+                    </td>
+                    <td className="px-5 py-4">
+                      <span
+                        className={`text-[10px] font-mono font-bold px-2.5 py-1 rounded-full uppercase border ${
+                          row.diagnosis === 'NEEDS_CLARIFICATION'
+                            ? 'bg-purple-50 dark:bg-purple-950 text-purple-700 dark:text-purple-300 border-purple-200 dark:border-purple-800'
+                            : row.diagnosis === 'TRAINING_GAP'
+                            ? 'bg-amber-50 dark:bg-amber-950 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+                            : row.diagnosis === 'HEALTHY_GOVERNANCE'
+                            ? 'bg-emerald-50 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                            : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500 border-zinc-200 dark:border-zinc-700'
+                        }`}
+                      >
+                        {row.diagnosis_label}
+                      </span>
+                    </td>
+                    <td className="px-5 py-4 font-mono text-[11px] text-zinc-500 dark:text-zinc-400">
+                      {row.last_triggered_display || 'Never'}
+                    </td>
+                    <td className="px-5 py-4">
+                      <button
+                        type="button"
+                        onClick={() => setDrillDownRule(row)}
+                        className="text-emerald-700 dark:text-emerald-400 font-semibold hover:underline flex items-center gap-1 cursor-pointer"
+                      >
+                        <span>Drill-down</span>
+                        <ChevronRight className="w-3.5 h-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Bottom Grid: Per-Writer Breakdown & Trend Sparkline */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* Trend Sparkline */}
+        <div className="lg:col-span-7 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-6 shadow-2xs">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h3 className="text-sm font-bold text-zinc-900 dark:text-white flex items-center gap-2">
+                <TrendingUp className="w-4 h-4 text-emerald-600" />
+                <span>Audit Volume &amp; Violations Trend</span>
+              </h3>
+              <p className="text-xs text-zinc-500 mt-0.5">
+                Dynamic daily activity computed from AuditEvent records in {windowDays}d window.
+              </p>
+            </div>
+            <div className="flex items-center gap-3 text-xs text-zinc-600 dark:text-zinc-400">
+              <span className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-xs bg-[#0F5132] inline-block"></span>
+                <span>Audits</span>
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-xs bg-amber-500 inline-block"></span>
+                <span>Violations</span>
+              </span>
+            </div>
+          </div>
+
+          <div className="h-40 flex items-end justify-between gap-1.5 pt-4 border-b border-zinc-100 dark:border-zinc-800 overflow-x-auto">
+            {(telemetry.trend_sparkline || []).slice(-15).map((point, idx) => {
+              const maxVal = Math.max(
+                ...telemetry.trend_sparkline.map((p) => Math.max(p.audits, p.violations)),
+                10
+              );
+              const auditH = `${Math.min(100, Math.round((point.audits / maxVal) * 100))}%`;
+              const violH = `${Math.min(100, Math.round((point.violations / maxVal) * 100))}%`;
+
+              return (
+                <div key={idx} className="flex-1 min-w-[20px] flex flex-col items-center gap-1">
+                  <div className="w-full flex items-end justify-center gap-0.5 h-28">
+                    <div
+                      style={{ height: auditH }}
+                      className="w-2 bg-[#0F5132] rounded-t-xs transition-all"
+                      title={`${point.date}: ${point.audits} Audits`}
+                    />
+                    <div
+                      style={{ height: violH }}
+                      className="w-2 bg-amber-500 rounded-t-xs transition-all"
+                      title={`${point.date}: ${point.violations} Violations`}
+                    />
+                  </div>
+                  <span className="text-[9px] font-mono text-zinc-400 truncate">
+                    {point.date}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Per-Writer Breakdown */}
+        <div className="lg:col-span-5 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-6 shadow-2xs">
+          <h3 className="text-sm font-bold text-zinc-900 dark:text-white flex items-center gap-2 mb-1">
+            <Users className="w-4 h-4 text-emerald-600" />
+            <span>Per-Writer Compliance Adherence</span>
+          </h3>
+          <p className="text-xs text-zinc-500 mb-4">
+            Total rule violations attributed in window.
+          </p>
+
+          <div className="space-y-3">
+            {(telemetry.writers || []).length === 0 ? (
+              <div className="text-center py-8 text-zinc-400 text-xs">
+                No writer activity recorded in this window.
+              </div>
+            ) : (
+              (telemetry.writers || []).map((w) => (
+                <div
+                  key={w.user_id}
+                  className="flex items-center justify-between p-3 rounded-lg border border-zinc-100 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30 text-xs"
+                >
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-7 h-7 rounded-full bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 font-bold flex items-center justify-center font-mono">
+                      {w.name ? w.name[0].toUpperCase() : 'U'}
+                    </div>
+                    <div>
+                      <div className="font-semibold text-zinc-900 dark:text-white">
+                        {w.name}
+                      </div>
+                      <div className="text-[10px] text-zinc-400 font-mono">@{w.username}</div>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <span className="font-mono font-bold text-zinc-900 dark:text-white">
+                      {w.violations_count}
+                    </span>
+                    <span className="text-zinc-400 text-[11px]"> violations</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Admin System Infrastructure & Production Health Card (Phase R4) */}
+      <SystemHealthCard apiBase={apiBase} className="mt-8" />
 
       {/* ============================================================== */}
-      {/* BLAST RADIUS & BULK RE-AUDIT INSPECTOR MODAL                  */}
+      {/* DRILL-DOWN MODAL                                               */}
       {/* ============================================================== */}
-      {blastModalOpen && selectedFactForBlast && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-3xl w-full p-6 shadow-2xl space-y-5 animate-scale-in max-h-[90vh] overflow-y-auto">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between pb-3 border-b border-zinc-200">
-              <div className="flex items-center gap-2">
-                <AlertOctagon className="w-5 h-5 text-rose-600" />
-                <div>
-                  <h3 className="font-bold text-zinc-900 text-base">
-                    Blast Radius Assessment: {selectedFactForBlast.fact_code}
-                  </h3>
-                  <p className="text-xs text-zinc-500 font-mono">
-                    Category: {selectedFactForBlast.category} · Valid Until: {selectedFactForBlast.valid_until}
-                  </p>
+      {drillDownRule && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl max-w-xl w-full p-6 shadow-2xl animate-fade-in">
+            <div className="flex items-start justify-between pb-4 border-b border-zinc-100 dark:border-zinc-800">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="font-mono font-bold text-zinc-900 dark:text-white text-base">
+                    {drillDownRule.rule_code}
+                  </span>
+                  <span
+                    className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase ${
+                      drillDownRule.severity === 'BLOCKER'
+                        ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                        : 'bg-amber-100 text-amber-800 border border-amber-200'
+                    }`}
+                  >
+                    {drillDownRule.severity}
+                  </span>
+                  <span className="text-[10px] font-mono uppercase bg-zinc-100 dark:bg-zinc-800 px-2 py-0.5 rounded text-zinc-500">
+                    {drillDownRule.pillar}
+                  </span>
                 </div>
+                <h3 className="text-sm font-bold text-zinc-800 dark:text-zinc-200 mt-1">
+                  {drillDownRule.title}
+                </h3>
               </div>
               <button
                 type="button"
-                onClick={() => setBlastModalOpen(false)}
-                className="text-zinc-400 hover:text-zinc-800 p-1 rounded-lg cursor-pointer"
+                onClick={() => setDrillDownRule(null)}
+                className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            {/* Fact Statement Banner */}
-            <div className="bg-zinc-50 border border-zinc-200 rounded-xl p-4 text-xs space-y-1">
-              <span className="font-bold text-zinc-500 uppercase text-[10px]">VERIFIED TRUTH CLAIM:</span>
-              <p className="text-zinc-900 font-medium text-sm">“{selectedFactForBlast.claim_truth}”</p>
-              {selectedFactForBlast.superseded_by_text && (
-                <p className="text-amber-800 pt-1 font-semibold">
-                  Superseded By: {selectedFactForBlast.superseded_by_text}
+            {/* Drill-down Diagnostics & Math */}
+            <div className="py-4 space-y-4 text-xs">
+              <div className="bg-zinc-50 dark:bg-zinc-800/40 p-3.5 rounded-xl border border-zinc-200 dark:border-zinc-700">
+                <div className="font-bold text-zinc-700 dark:text-zinc-300 mb-2">
+                  Diagnostic Rationale:
+                </div>
+                <div className="flex items-center gap-2 mb-2">
+                  <span
+                    className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded uppercase border ${
+                      drillDownRule.diagnosis === 'NEEDS_CLARIFICATION'
+                        ? 'bg-purple-50 text-purple-700 border-purple-200'
+                        : drillDownRule.diagnosis === 'TRAINING_GAP'
+                        ? 'bg-amber-50 text-amber-700 border-amber-200'
+                        : drillDownRule.diagnosis === 'HEALTHY_GOVERNANCE'
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-zinc-100 text-zinc-500 border-zinc-200'
+                    }`}
+                  >
+                    {drillDownRule.diagnosis_label}
+                  </span>
+                  <span className="text-zinc-500">
+                    ({drillDownRule.triggers} triggers, {drillDownRule.overrides} overrides)
+                  </span>
+                </div>
+                <p className="text-zinc-600 dark:text-zinc-300 leading-relaxed">
+                  {drillDownRule.hint}
                 </p>
-              )}
+              </div>
+
+              {/* Mathematical Formula Breakdown */}
+              <div className="space-y-1 font-mono text-[11px] bg-zinc-900 text-zinc-100 p-3.5 rounded-xl">
+                <div className="text-zinc-400 font-bold mb-1">// Mathematical Computation:</div>
+                <div>override_rate = {drillDownRule.overrides} / {drillDownRule.triggers} = {drillDownRule.override_rate_pct}%</div>
+                <div>friction_score = override_rate × ln(triggers + 1) = {drillDownRule.friction_score}</div>
+                <div>last_triggered = {drillDownRule.last_triggered_display || 'Never'}</div>
+              </div>
             </div>
 
-            {/* Affected Submissions List */}
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-600">
-                  AFFECTED ASSETS IN BLAST RADIUS ({blastData?.blast_radius_count || 0})
-                </h4>
-                <span className="text-[11px] font-mono text-zinc-400">
-                  Submissions citing this fact
-                </span>
-              </div>
-
-              {!blastData ? (
-                <div className="py-8 text-center text-xs text-zinc-400">
-                  Loading blast radius dependencies...
-                </div>
-              ) : blastData.affected_submissions.length === 0 ? (
-                <div className="p-6 bg-emerald-50 rounded-xl border border-emerald-200 text-center text-xs text-emerald-900 font-semibold">
-                  Zero campaign assets cite this claim. Safe from retroactive compliance risk.
-                </div>
-              ) : (
-                <div className="divide-y divide-zinc-200 border border-zinc-200 rounded-xl overflow-hidden">
-                  {blastData.affected_submissions.map((sub, idx) => (
-                    <div key={idx} className="p-4 bg-white hover:bg-zinc-50/60 transition space-y-2 text-xs">
-                      <div className="flex items-center justify-between">
-                        <span className="font-bold text-zinc-900 text-sm">{sub.title}</span>
-                        <span
-                          className={`font-mono text-[10px] px-2 py-0.5 rounded font-bold uppercase ${
-                            sub.status === 'APPROVED'
-                              ? 'bg-emerald-100 text-emerald-800'
-                              : sub.status === 'STALE_REAUDIT_REQUIRED'
-                              ? 'bg-rose-100 text-rose-800'
-                              : 'bg-amber-100 text-amber-800'
-                          }`}
-                        >
-                          {sub.status}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-3 text-zinc-500 font-mono text-[11px]">
-                        <span>Author: {sub.author}</span>
-                        <span>·</span>
-                        <span>Channel: {sub.channel}</span>
-                        <span>·</span>
-                        <span>Score: {sub.compliance_score}/100</span>
-                      </div>
-                      <div className="bg-zinc-50 p-2.5 rounded-lg border border-zinc-100 text-zinc-700 italic">
-                        “{sub.citing_snippet}”
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Modal Bottom Actions */}
-            <div className="flex items-center justify-between pt-4 border-t border-zinc-200">
-              <div className="text-xs text-zinc-500">
-                Bulk re-audit recalculates scores &amp; flags outdated claims.
-              </div>
-
-              <div className="flex items-center gap-3">
-                <button
-                  type="button"
-                  onClick={() => setBlastModalOpen(false)}
-                  className="px-4 py-2 border border-zinc-200 bg-white hover:bg-zinc-50 text-zinc-800 text-xs font-semibold rounded-lg transition cursor-pointer"
-                >
-                  Close
-                </button>
-
-                <button
-                  type="button"
-                  disabled={isBulkAuditing || !blastData || blastData.affected_submissions.length === 0}
-                  onClick={() => handleRunBulkReAudit(selectedFactForBlast.id)}
-                  className="px-5 py-2 bg-rose-700 hover:bg-rose-800 text-white text-xs font-bold rounded-lg transition cursor-pointer flex items-center gap-2 shadow-xs disabled:opacity-50"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isBulkAuditing ? 'animate-spin' : ''}`} />
-                  <span>{isBulkAuditing ? 'Executing Re-Audit...' : 'Execute Bulk Re-Audit'}</span>
-                </button>
-              </div>
+            <div className="pt-3 border-t border-zinc-100 dark:border-zinc-800 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setDrillDownRule(null)}
+                className="bg-zinc-900 text-white text-xs px-4 py-2 rounded-lg font-semibold hover:bg-zinc-800 cursor-pointer"
+              >
+                Close
+              </button>
             </div>
           </div>
         </div>
       )}
-
-      {/* Global Status Footer */}
-      <footer className="flex flex-col sm:flex-row items-center justify-between text-xs text-zinc-400 pt-6 border-t border-[#E5E7EB]">
-        <div>All engines operational · Verified cryptographic ledger v3.2</div>
-        <div className="mt-2 sm:mt-0">BrandGuard · Deterministic-first governance</div>
-      </footer>
     </div>
   );
 }
